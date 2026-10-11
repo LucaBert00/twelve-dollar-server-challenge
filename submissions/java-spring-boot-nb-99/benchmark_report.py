@@ -110,10 +110,11 @@ def report(directory, state):
         state["environment"].get("settings", {}).get("confirm_seconds", 300) < 300
     )
     custom_ramp = state["environment"].get("settings", {}).get("ramp_seconds", 60) != 60
+    mode = state["environment"].get("mode", "local")
     label = (
         "Smoke-test baseline"
         if short_confirmation
-        else ("Custom-ramp baseline" if custom_ramp else "Confirmed local baseline")
+        else ("Custom-ramp baseline" if custom_ramp else f"Confirmed {mode} baseline")
     )
     result = (
         f"{label}: {confirmed:,} virtual users{' or more, a lower bound' if state['status'] == 'capped' else ''}."
@@ -121,12 +122,12 @@ def report(directory, state):
         else "No confirmed result."
     )
     notes = [
-        "Local Compose benchmark, not an official challenge score. k6 and Nginx share the host with the app.",
+        f"{mode.capitalize()}-mode benchmark, not an official challenge score. Results describe this machine and deployment.",
         "Latency and throughput include ramp-up, hold, ramp-down, and graceful completion. Charts exclude warm-up.",
         "Chart points are not joined: probes and confirmations have different hold durations. Outlined points are confirmations.",
-        "One fresh seeded database per search. Warm-up and later runs share that instance, so writes accumulate.",
+        "The warm-up run exercises the running app before the search and is excluded from the score. Writes accumulate across runs.",
         "Benchmark status uses the challenge thresholds. Endpoint check failures are reported separately; unexercised checks are not passes.",
-        "Memory peak is cumulative for the app instance. CPU is the app's average over each complete run, not a sampled peak.",
+        "App CPU is the average over each run's sampling window. Memory peak is the highest sample, taken every 2 seconds.",
     ]
     headers = [
         "Run",
@@ -208,16 +209,17 @@ def report(directory, state):
             if run.get(key)
         ]
         resource = run.get("resources", {})
-        usage = (
-            (
+        if not resource:
+            usage = ""
+        elif "unavailable" in resource:
+            usage = f"App resources unavailable: {resource['unavailable']}."
+        else:
+            oom = resource.get("oom_kills")
+            usage = (
                 f"App average CPU: {format_number(resource.get('cpu_percent'))}% of one core. "
-                f"Instance cgroup memory peak, including page cache: {format_number(resource.get('peak_memory_mib'))} MiB. "
-                f"Instance peak swap: {format_number(resource.get('swap_peak_mib'))} MiB. "
-                f"OOM kills: {resource.get('oom_kills', 'n/a')}. Restart count: {resource.get('restart_count', 'n/a')}."
+                f"Sampled memory peak: {format_number(resource.get('peak_memory_mib'))} MiB. "
+                f"OOM kills: {'n/a' if oom is None else oom}. Source: {resource.get('source')}."
             )
-            if resource
-            else ""
-        )
         metrics = run.get("metrics", {})
         latency = (
             f"Average latency: {format_number(metrics.get('avg_ms'))} ms. Maximum latency: {format_number(metrics.get('max_ms'))} ms."

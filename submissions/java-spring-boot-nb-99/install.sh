@@ -1,5 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
+case "$(uname -m)" in
+  x86_64)
+    JAVA_ARCH=x64
+    JAVA_SHA256=8daf77d1aacffe38c9889689bc224a13557de77559d9a5bb91991e6a298baa0d
+    ;;
+  aarch64|arm64)
+    JAVA_ARCH=aarch64
+    JAVA_SHA256=5c83b7d2121ed482fd06831a1eba1633dbab818aba6addddf48e075b97e6e9b8
+    ;;
+  *) echo "Unsupported Linux architecture: $(uname -m)" >&2; exit 1 ;;
+esac
 apt-get update
 apt-get install -y --no-install-recommends ca-certificates curl tar gzip
 
@@ -10,9 +21,9 @@ trap 'rm -rf "$TMP"' EXIT
 
 if [ ! -f "$JAVA_DIR/.installed" ]; then
   curl --fail --location --retry 3 --retry-all-errors --connect-timeout 30 --max-time 300 \
-    'https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.1%2B8/OpenJDK25U-jdk_x64_linux_hotspot_25.0.1_8.tar.gz' \
+    "https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.1%2B8/OpenJDK25U-jdk_${JAVA_ARCH}_linux_hotspot_25.0.1_8.tar.gz" \
     -o "$TMP/java.tar.gz"
-  echo "8daf77d1aacffe38c9889689bc224a13557de77559d9a5bb91991e6a298baa0d  $TMP/java.tar.gz" | sha256sum -c -
+  echo "$JAVA_SHA256  $TMP/java.tar.gz" | sha256sum -c -
   mkdir -p "$TMP/java" "$JAVA_DIR"
   tar -xzf "$TMP/java.tar.gz" -C "$TMP/java" --strip-components=1 --no-same-owner
   cp -a "$TMP/java/." "$JAVA_DIR/"

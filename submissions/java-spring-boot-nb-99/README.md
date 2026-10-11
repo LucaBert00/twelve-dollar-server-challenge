@@ -16,86 +16,120 @@ Spring Boot's dependency management pins Tomcat, Jackson 3, HikariCP, Spring JDB
 and test dependencies. The POM pins the formatter and its Java formatter engine.
 `install.sh` verifies the pinned Java and Maven archives against embedded checksums.
 
-## Makefile workflow
+## Make workflow
 
-From this directory, run `make help` to list the targets. You need Make, Bash,
-Docker Engine with Compose, and Python 3.10+. The default build uses Docker's
-pinned Java and Maven, not your host toolchain.
+Run `make help` from this directory. Builds use your installed Maven and Java 25.
+The challenge suite and benchmark run in Docker by default (`MODE=docker`) or on
+this host (`MODE=direct`). Reports use local Python 3.10+. The same commands run
+natively on ARM64 Macs and AMD64 Linux.
 
 ```bash
-make all
+make all               # build, challenge suite, warm-up, limit search, reports
+make all MODE=direct
 ```
-
-This command builds the app and exports `target/server.jar`, runs the Java
-formatting and integration checks, runs the unchanged
-42-check challenge suite, and then runs the autonomous benchmark search.
-Each step must succeed before the next starts, even with `make -j`.
-The search writes Markdown, HTML, JSON, and SVG reports without prompts or a
-browser. Its default budget is one hour, excluding builds and startup.
-An unsuccessful or incomplete search makes Make fail, but retains its reports.
-
-The correctness suite owns a unique Compose project with a fresh database and
-an automatically assigned localhost port. It deletes only that project's
-containers and volume on success, failure, or a handled interruption. The
-benchmark owns a separate project and database, as described below.
-Neither workflow starts, stops, or resets your regular development stack.
-Images and build cache remain available afterward.
 
 | Target | Action |
 | --- | --- |
-| `make build` | Build all images, check Java formatting, run Java tests, export the JAR |
-| `make build-local` | Run Maven `clean verify` with configurable `JAVA_HOME`, `MAVEN`, and `MAVEN_ARGS` |
-| `make image` | Build app, seed, and challenge-test images |
-| `make test` | Run Java and isolated challenge tests |
-| `make test-java` | Build the app image, including Java formatting and integration tests |
-| `make test-suite` | Build and run the challenge suite on a fresh disposable stack |
-| `make up` | Build and start the regular stack, then wait for readiness |
-| `make down` | Stop the regular stack and keep its database |
-| `make logs`, `make ps`, `make health` | Inspect the regular stack |
-| `make benchmark` | Build source, search the load limit, write reports, and clean up |
-| `make benchmark-smoke` | Run a short container/report check, not a comparable score |
-| `make report` | Regenerate reports from the most recently updated saved results |
-| `make check-tools` | Check Docker, Compose, and the Python version |
+| `make build` | Run `mvn clean verify`: formatting check, Java tests, `target/server.jar` |
+| `make test` | Run `make build`, then the challenge suite |
+| `make test-suite` | Run the unchanged 42-check `test/test.sh` against a fresh database |
+| `make benchmark` | Warm up the app, search its load limit, and write reports |
+| `make benchmark-smoke` | Run a short benchmark that checks the tooling; not a score |
+| `make report` | Regenerate the latest report, or the one in `REPORT_DIR` |
+| `make image` | Build native app, seed, and test images |
+| `make up`, `make down`, `make logs` | Manage the regular Docker stack on `LOCAL_PORT` (default 3000) |
+| `make run` | Run the JAR with installed Java; requires `SQLITE_PATH` and `JWT_SECRET` |
 
-Override defaults on the command line or through environment variables:
+### Modes
+
+`MODE=docker` starts a disposable Compose project. A seed container creates a
+fresh database. The app and Nginx run in one `server` container limited to 1 vCPU
+and 2 GiB of memory without swap, the budget of the challenge VPS. Nginx uses the
+challenge's `bench/nginx.conf` and reaches the app at `127.0.0.1:3000`, as on the
+VPS. The challenge suite and k6 run in separate containers on the same network,
+outside that limit. Docker uses images for its own architecture. Each run deletes
+only its own containers, network, and volume. Set `BUILD_IMAGES=false` to reuse
+images from `make image`; `make all` does this.
+
+`BENCH_K6=local` keeps the server in Docker but runs k6 on this host against the
+published port. Use it when k6 needs more memory than the Docker VM has left; at
+20,000 users k6 needs several GiB. Installed k6 v2 is used when present;
+otherwise k6 2.2.0 is downloaded to a temporary directory. Requests then cross
+Docker's port forwarding, which adds some latency on macOS.
+
+`MODE=direct` runs the built JAR on this host against a fresh copy of
+`seed/feed.db`. If the seed is missing, Node and sqlite3 generate it. The
+challenge suite calls the app directly and needs curl, jq, and openssl. The
+benchmark puts Nginx with the challenge's `bench/nginx.conf` in front of the app
+and runs k6 on the host. Installed Java 25, Nginx, and k6 v2 are used when present.
+Otherwise the script downloads Java 25.0.1 and k6 2.2.0, or builds Nginx 1.28.0
+with the system C compiler, into a temporary directory. Every download is
+checked against a pinned SHA-256. The script deletes that directory and stops
+its processes afterwards. Direct mode does not limit the app's CPU or memory.
+
+`MODE=k8s` is reserved for a kustomize deployment. `scripts/k8s.sh` describes the
+plan and currently exits with an error.
+
+Every mode picks free localhost ports, so it does not conflict with `make up`.
+
+### Benchmark
+
+The mode script deploys the app and passes its URL to `benchmark.py`. The tool
+waits for `/health`, then runs:
+
+1. A warm-up of the running app with 1,000 users for 2 minutes, excluded from the score.
+2. 1-minute probes from 2,500 users, doubling until a failure or 20,000 users.
+3. Refinement between the last pass and the first failure to within 250 users.
+4. A 5-minute confirmation. A failed confirmation steps down 250 users.
+
+Each run adds a 60-second ramp-up and the workload's 30-second ramp-down. The
+search budget is one hour after the app is healthy. The tool never starts a run
+that cannot finish within the budget. A run passes with p95 below 500 ms, p99
+below 1,000 ms, and fewer than 1% failed requests. A pass at the user cap is a
+lower bound, not a maximum.
+
+Override the defaults shown by `make help`:
 
 ```bash
-make up LOCAL_PORT=8080 COMPOSE_PROJECT=java-dev WAIT_TIMEOUT=180
-make image BUILD_ARGS="--no-cache"
 make benchmark BENCH_MAX_VUS=40000 BENCH_CONFIRM_RUNS=3 BENCH_BUDGET_SECONDS=7200
-make benchmark BENCH_REUSE_IMAGES=true BENCH_OUTPUT=benchmark-results/my-new-run
-make report REPORT_DIR=benchmark-results/my-new-run
+make benchmark MODE=direct BENCH_OUTPUT=benchmark-results/my-run
+make report REPORT_DIR=benchmark-results/my-run
 ```
 
-`make all` always reuses the images it just built for its benchmark.
-`make test-suite` builds its images by default; set `SUITE_BUILD=false` to use
-existing images. The full pipeline does this automatically to test the images
-it just built without rebuilding them.
-Standalone `make benchmark` builds source unless you set `BENCH_REUSE_IMAGES=true`.
-Reused images have the fixed `twelve-dollar-java-app:latest` and
-`twelve-dollar-java-seed:latest` tags regardless of `COMPOSE_PROJECT`.
-Do not rebuild those tags concurrently with the full pipeline.
+`BENCH_ARGS` passes extra options to `benchmark.py`. See
+`python3 benchmark.py --help`.
 
-All search controls have Make variables. `make help` lists their defaults:
-`BENCH_PORT`, `BENCH_START_VUS`, `BENCH_MAX_VUS`, `BENCH_STEP`,
-`BENCH_WARMUP_VUS`, `BENCH_WARMUP_SECONDS`, `BENCH_PROBE_SECONDS`,
-`BENCH_CONFIRM_SECONDS`, `BENCH_CONFIRM_RUNS`, `BENCH_RAMP_SECONDS`, and
-`BENCH_BUDGET_SECONDS`. `BENCH_ARGS` passes additional CLI flags to `benchmark.py`.
-`BENCH_OUTPUT` must name a new directory; leaving it empty creates a unique run
-directory. `REPORT_DIR` defaults to `BENCH_OUTPUT` when set, otherwise the latest
-`benchmark-results/*/results.json` by modification time.
+The tool samples the app every 2 seconds during each run. Docker mode reads the
+`server` container's cgroup CPU, memory, and OOM kills, so the numbers cover the
+app and Nginx together, and records the enforced limits in the report. Direct
+mode reads the Java process's CPU time and resident memory. An app exit, restart,
+or OOM kill stops the search as an execution error, not a capacity failure. So do
+k6 errors, k6 being killed for lack of memory, missing summaries, and runs that
+miss the requested users or duration.
 
-`COMPOSE_FILE` selects a different development/test Compose file. The benchmark
-always uses this submission's `compose.yaml` and its own `BENCH_PORT`.
-`LOCAL_PORT` defaults to 3000. The benchmark still needs Docker with cgroup v2
-and the writable container bind mounts described below. Maven proxy environment
-variables work as documented in the Docker Compose section.
-Tool overrides are `DOCKER`, `PYTHON`, `MAVEN`, and `JAVA_HOME`.
-`DOCKER` applies to Make's Compose commands; the benchmark invokes `docker` on
-`PATH` directly. `make build-local` does not install tools or require sudo.
-It defaults to the `/opt` challenge toolchain unless your environment or command
-line sets `JAVA_HOME` or `MAVEN`. `COMPOSE_FILE` accepts one file path, not Docker
-Compose's colon-separated file list.
+Each search writes to a new `benchmark-results/<run-id>/` directory, which Git
+ignores. The files update after every run:
+
+- `report.md` and `report.html`: result, runs, thresholds, endpoint checks,
+  resources, charts, and settings.
+- `results.json`: the data that `make report` renders.
+- `run-*.log`, `k6/run-*.json`, and `k6/run-*.events.jsonl`: raw k6 output.
+- `p95.svg`, `p99.svg`, `throughput.svg`, and `errors.svg`: charts.
+
+The exit code is 0 for a confirmed result, including a capped lower bound, 1
+when no candidate passes, 2 for an execution error or exhausted budget, and 130
+when interrupted. Ctrl-C keeps finished results and still removes the deployment.
+
+A local result is not a challenge score. k6, Nginx, and the app share your
+machine, and a Mac measures its own CPU or Docker VM.
+
+### Run the app yourself
+
+`make run` needs a working copy of the seed. Never point it at `seed/feed.db`:
+
+```bash
+SQLITE_PATH=/absolute/path/to/copy.db JWT_SECRET=twelve-dollar-challenge make run
+```
 
 ## Run locally with Docker Compose
 
@@ -110,9 +144,10 @@ docker compose --profile test run --rm test
 
 The seed container generates the repository's deterministic seed and verifies its
 content checksum. It installs a fresh copy and the seed tokens in a named volume.
-The app opens that SQLite file in-process. Nginx publishes port 3000 on localhost
-and forwards requests to the app container. Only Nginx has a published port.
-The app runs as UID 10001 with one CPU and a 1 GiB container memory limit.
+The app opens that SQLite file in-process. The `server` container runs Nginx
+with the challenge's `bench/nginx.conf` and the app as UID 10001. Only Nginx's
+port 80 is published, on localhost port 3000. Both processes share 1 vCPU and
+2 GiB of memory without swap.
 The Compose JWT secret is the public challenge secret. This is not a production
 authentication setup. Do not expose it publicly with that secret.
 
@@ -136,9 +171,9 @@ docker compose up --build -d --wait
 docker compose --profile test run --rm test
 ```
 
-Read logs with `docker compose logs app nginx seed`. The local Nginx configuration
-copies the challenge's upstream keep-alive and proxy settings, except that its
-upstream uses the Docker service name rather than `127.0.0.1`.
+Read logs with `docker compose logs server seed`. Nginx's error log goes to the
+container log; its access log stays at `/var/log/nginx/bench.access.log` inside
+the container, as on the VPS.
 Compose is a development setup, not evidence of a benchmark score.
 
 If your network requires an HTTP proxy, Maven does not read `HTTPS_PROXY` itself.
@@ -152,135 +187,12 @@ If the published localhost port times out, check the proxy without host port
 forwarding first:
 
 ```bash
-docker compose --profile test run --rm --no-deps test -c 'curl --noproxy "*" http://nginx/health'
+docker compose --profile test run --rm --no-deps test -c 'curl --noproxy "*" http://server/health'
 ```
 
 If this returns healthy JSON, inspect your host's Docker or WSL port-forwarding
 configuration rather than changing the API. Do not delete the data volume to
 diagnose a network problem.
-
-## Automated local limit search
-
-The wrapper needs Python 3.10+ on Linux or WSL, Docker Compose with JSON
-configuration output, and a Docker host using cgroup v2 for resource counters.
-The app, seed generator, and k6 run in containers. It does not install Java or k6
-on your host. From this submission directory, run:
-
-```bash
-python3 benchmark.py
-```
-
-By default, it builds the source with the existing Dockerfile, including its
-formatting and integration tests, using project-specific image tags. It does not
-replace the regular stack's image tags. Build images and cache are retained.
-The Maven proxy settings described above still apply. Use `--reuse-images` to
-reuse the local `twelve-dollar-java-app:latest` and `twelve-dollar-java-seed:latest`
-images instead. Build them first with `docker compose build app seed`; reused
-images may not match the current source. Their image IDs are resolved before
-startup, so later re-tagging cannot change this search. k6 2.2.0 is pinned by digest and
-is pulled only if the image is missing.
-
-Every search owns a unique Compose project and a fresh seeded database volume.
-The database is fresh per search, not per run. Warm-up and later runs share the
-instance, so benchmark posts and likes accumulate.
-It does not stop, reset, or test against your regular stack. Port 3001 is used for
-localhost health checks; choose another with `--port` if it is occupied. k6 sends
-the unchanged `bench/load.js` workload over the Compose bridge through Nginx.
-The app has the existing one-CPU/1-GiB limit, with app swap disabled. This does not
-emulate the challenge's complete one-vCPU/2-GiB VM. Nginx, k6, and other host
-processes still share your local machine.
-
-The default search performs:
-
-1. A 1,000-user warm-up with a 2-minute hold, excluded from the score.
-2. 1-minute probes starting at 2,500 users, doubling until failure or 20,000 users.
-3. Refinement of the passing/failing interval to within 250 users.
-4. A 5-minute confirmation hold. A failed confirmation steps down 250 users.
-
-Each run also has a 60-second ramp-up, the workload's fixed 30-second ramp-down,
-and graceful completion. Short probes reduce search time but do not confirm a
-score. Use `--probe-seconds 300 --budget-seconds 10800` for 5-minute probes with a
-larger budget. The default load-search budget is
-one hour, excluding image builds and startup. The wrapper does not begin a run
-unless the remaining budget can fit its stages, a conservative 30-second graceful
-completion allowance, and a 30-second startup allowance. A run that exceeds the
-remaining budget is stopped and reported as budget exhaustion.
-
-For example, increase the cap and require three consecutive confirmations:
-
-```bash
-python3 benchmark.py --reuse-images --max-vus 40000 --confirm-runs 3 --budget-seconds 7200
-```
-
-`--start-vus` and `--max-vus` must be multiples of `--step`. A successful result
-at the user cap is reported as a lower bound, not a discovered maximum. A budget
-stop leaves the search incomplete. There is no automatic resume, and each new
-invocation starts a fresh instance.
-
-### Reports and retained evidence
-
-Reports update after each run in a new, ignored `benchmark-results/<run-id>/`
-directory. Use `--output <new-directory>` to choose another location. Existing
-output directories are never overwritten.
-
-- `report.md`: run overview, threshold and endpoint-check outcomes, charts,
-  confirmation spread, resource measurements, and environment settings.
-- `report.html`: the same results with embedded SVG charts; no JavaScript,
-  external fonts, or CDN dependencies. Log links need the accompanying files.
-- `results.json`: normalized results and search status.
-- `k6/run-*.json`, `run-*.log`, and `k6/run-*.events.jsonl`: raw k6 summaries,
-  console output, and structured events. Only the `k6/` subdirectory is writable
-  from the load generator; Compose configuration and reports remain outside it.
-  Build, startup, stack, and cleanup logs are also
-  retained when those steps run.
-- `p95.svg`, `p99.svg`, `throughput.svg`, and `errors.svg`: chart files linked from
-  Markdown and embedded in HTML.
-
-The challenge thresholds are p95 below 500 ms, p99 below 1,000 ms, and fewer than
-1% failed requests. JSON summaries and exit codes determine the benchmark result;
-console text is not used to extract metrics. The wrapper also verifies that k6
-reached the requested user count and ran for at least the requested stage time.
-Endpoint checks have separate
-passed/failed counts. An unexercised check is not reported as successful, and a
-check failure does not independently change the challenge's threshold verdict.
-The wrapper does not replace the 42-check correctness suite.
-
-Execution errors, missing summaries, zero work, structured k6 error events, and
-app restarts/OOM kills stop the search rather than being treated as capacity
-failures. Reports distinguish those outcomes from threshold failures. Missing
-optional memory/swap peak counters are reported as unavailable, not as zero.
-Rootless Docker, user-namespace remapping, and SELinux bind-mount restrictions
-have not been validated; the container user must be able to write the `k6/` mount.
-Ctrl-C, SIGTERM, or SIGHUP retains completed results and attempts cleanup.
-Cleanup stops any still-running k6 container before deleting only the
-search's containers, network, and database volume, never its report directory or
-the regular stack. SIGKILL or loss of Docker can prevent cleanup; use the saved
-`compose.json` and project name to remove that search afterward.
-
-The project name is `environment.project` in `results.json`. For manual cleanup:
-
-```bash
-docker compose -p <project> -f benchmark-results/<run-id>/compose.json --profile bench down --volumes --remove-orphans
-```
-
-Exit codes are 0 for a confirmed result, including a capped lower bound; 1 when
-no candidate passes confirmation; 2 for budget exhaustion, execution errors, or
-cleanup failures, invalid arguments, or an unavailable output directory; and 130
-for interruption. A cleanup failure after interruption returns 2.
-
-### Check the wrapper without a full search
-
-```bash
-python3 benchmark.py --reuse-images --warmup-vus 50 --start-vus 50 --max-vus 100 --step 50 \
-  --warmup-seconds 8 --probe-seconds 8 --confirm-seconds 10 --ramp-seconds 1 --budget-seconds 400
-```
-
-This command exercises containers, summary parsing, reports, and cleanup.
-Its short confirmation is explicitly marked as a smoke test. It is not a
-performance result comparable to a 5-minute hold. See `python3 benchmark.py --help`
-for all controls.
-Changing `--ramp-seconds` from 60 also marks the result as non-comparable to the
-default workload, even with a full-length confirmation.
 
 ## Benchmark VM contract
 

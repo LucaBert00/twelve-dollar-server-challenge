@@ -21,16 +21,21 @@ RUN bash build.sh
 
 FROM ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55 AS runtime
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl libstdc++6 zlib1g \
+    && apt-get install -y --no-install-recommends ca-certificates curl libstdc++6 nginx zlib1g \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd --uid 10001 --create-home app
+    && useradd --uid 10001 --create-home app \
+    && rm /etc/nginx/sites-enabled/default \
+    && sed -i -e 's/^worker_processes auto;/worker_processes 1;\nworker_rlimit_nofile 65535;/' \
+        -e 's/worker_connections 768;/worker_connections 16384;/' /etc/nginx/nginx.conf \
+    && ln -sf /dev/stderr /var/log/nginx/bench.error.log
+COPY bench/nginx.conf /etc/nginx/sites-enabled/bench.conf
+RUN nginx -t
 COPY --from=tools /opt/java-challenge-25.0.1 /opt/java-challenge-25.0.1
 WORKDIR /app
 COPY --from=build /app/target/server.jar ./target/server.jar
-COPY submissions/java-spring-boot-nb-99/start.sh ./start.sh
-USER 10001:10001
-EXPOSE 3000
-ENTRYPOINT ["bash", "/app/start.sh"]
+COPY submissions/java-spring-boot-nb-99/start.sh submissions/java-spring-boot-nb-99/container-start.sh ./
+EXPOSE 80
+ENTRYPOINT ["bash", "/app/container-start.sh"]
 
 FROM ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55 AS checks
 RUN apt-get update \

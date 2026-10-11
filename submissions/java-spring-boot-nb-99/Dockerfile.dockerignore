@@ -1,4 +1,7 @@
 **
+!bench/
+bench/**
+!bench/nginx.conf
 !schema.sql
 !seed/
 seed/**
