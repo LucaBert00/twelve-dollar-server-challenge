@@ -327,3 +327,37 @@ section {{ border-bottom: 1px solid #cbd5e1; padding: 12px 0; }} pre {{ overflow
 <h2>Interpretation</h2><ul>{"".join(f"<li>{escape(note)}</li>" for note in notes)}</ul>
 </main></body></html>"""
     write_text(directory / "report.html", page)
+
+
+def main(argv=None):
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Regenerate saved benchmark reports.")
+    parser.add_argument(
+        "directory",
+        nargs="?",
+        type=Path,
+        help="Run directory; defaults to latest results",
+    )
+    args = parser.parse_args(argv)
+    try:
+        directory = args.directory
+        if directory is None:
+            candidates = list(
+                (Path(__file__).resolve().parent / "benchmark-results").glob(
+                    "*/results.json"
+                )
+            )
+            if not candidates:
+                parser.error("No saved results. Run make benchmark or set REPORT_DIR.")
+            directory = max(candidates, key=lambda path: path.stat().st_mtime_ns).parent
+        state = json.loads((directory / "results.json").read_text(encoding="utf-8"))
+        report(directory, state)
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        parser.error(f"Cannot regenerate report: {error}")
+    print(f"Reports: {directory / 'report.md'} and {directory / 'report.html'}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

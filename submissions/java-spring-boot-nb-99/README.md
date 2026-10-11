@@ -16,6 +16,87 @@ Spring Boot's dependency management pins Tomcat, Jackson 3, HikariCP, Spring JDB
 and test dependencies. The POM pins the formatter and its Java formatter engine.
 `install.sh` verifies the pinned Java and Maven archives against embedded checksums.
 
+## Makefile workflow
+
+From this directory, run `make help` to list the targets. You need Make, Bash,
+Docker Engine with Compose, and Python 3.10+. The default build uses Docker's
+pinned Java and Maven, not your host toolchain.
+
+```bash
+make all
+```
+
+This command builds the app and exports `target/server.jar`, runs the Java
+formatting and integration checks, runs the unchanged
+42-check challenge suite, and then runs the autonomous benchmark search.
+Each step must succeed before the next starts, even with `make -j`.
+The search writes Markdown, HTML, JSON, and SVG reports without prompts or a
+browser. Its default budget is one hour, excluding builds and startup.
+An unsuccessful or incomplete search makes Make fail, but retains its reports.
+
+The correctness suite owns a unique Compose project with a fresh database and
+an automatically assigned localhost port. It deletes only that project's
+containers and volume on success, failure, or a handled interruption. The
+benchmark owns a separate project and database, as described below.
+Neither workflow starts, stops, or resets your regular development stack.
+Images and build cache remain available afterward.
+
+| Target | Action |
+| --- | --- |
+| `make build` | Build all images, check Java formatting, run Java tests, export the JAR |
+| `make build-local` | Run Maven `clean verify` with configurable `JAVA_HOME`, `MAVEN`, and `MAVEN_ARGS` |
+| `make image` | Build app, seed, and challenge-test images |
+| `make test` | Run Java and isolated challenge tests |
+| `make test-java` | Build the app image, including Java formatting and integration tests |
+| `make test-suite` | Build and run the challenge suite on a fresh disposable stack |
+| `make up` | Build and start the regular stack, then wait for readiness |
+| `make down` | Stop the regular stack and keep its database |
+| `make logs`, `make ps`, `make health` | Inspect the regular stack |
+| `make benchmark` | Build source, search the load limit, write reports, and clean up |
+| `make benchmark-smoke` | Run a short container/report check, not a comparable score |
+| `make report` | Regenerate reports from the most recently updated saved results |
+| `make check-tools` | Check Docker, Compose, and the Python version |
+
+Override defaults on the command line or through environment variables:
+
+```bash
+make up LOCAL_PORT=8080 COMPOSE_PROJECT=java-dev WAIT_TIMEOUT=180
+make image BUILD_ARGS="--no-cache"
+make benchmark BENCH_MAX_VUS=40000 BENCH_CONFIRM_RUNS=3 BENCH_BUDGET_SECONDS=7200
+make benchmark BENCH_REUSE_IMAGES=true BENCH_OUTPUT=benchmark-results/my-new-run
+make report REPORT_DIR=benchmark-results/my-new-run
+```
+
+`make all` always reuses the images it just built for its benchmark.
+`make test-suite` builds its images by default; set `SUITE_BUILD=false` to use
+existing images. The full pipeline does this automatically to test the images
+it just built without rebuilding them.
+Standalone `make benchmark` builds source unless you set `BENCH_REUSE_IMAGES=true`.
+Reused images have the fixed `twelve-dollar-java-app:latest` and
+`twelve-dollar-java-seed:latest` tags regardless of `COMPOSE_PROJECT`.
+Do not rebuild those tags concurrently with the full pipeline.
+
+All search controls have Make variables. `make help` lists their defaults:
+`BENCH_PORT`, `BENCH_START_VUS`, `BENCH_MAX_VUS`, `BENCH_STEP`,
+`BENCH_WARMUP_VUS`, `BENCH_WARMUP_SECONDS`, `BENCH_PROBE_SECONDS`,
+`BENCH_CONFIRM_SECONDS`, `BENCH_CONFIRM_RUNS`, `BENCH_RAMP_SECONDS`, and
+`BENCH_BUDGET_SECONDS`. `BENCH_ARGS` passes additional CLI flags to `benchmark.py`.
+`BENCH_OUTPUT` must name a new directory; leaving it empty creates a unique run
+directory. `REPORT_DIR` defaults to `BENCH_OUTPUT` when set, otherwise the latest
+`benchmark-results/*/results.json` by modification time.
+
+`COMPOSE_FILE` selects a different development/test Compose file. The benchmark
+always uses this submission's `compose.yaml` and its own `BENCH_PORT`.
+`LOCAL_PORT` defaults to 3000. The benchmark still needs Docker with cgroup v2
+and the writable container bind mounts described below. Maven proxy environment
+variables work as documented in the Docker Compose section.
+Tool overrides are `DOCKER`, `PYTHON`, `MAVEN`, and `JAVA_HOME`.
+`DOCKER` applies to Make's Compose commands; the benchmark invokes `docker` on
+`PATH` directly. `make build-local` does not install tools or require sudo.
+It defaults to the `/opt` challenge toolchain unless your environment or command
+line sets `JAVA_HOME` or `MAVEN`. `COMPOSE_FILE` accepts one file path, not Docker
+Compose's colon-separated file list.
+
 ## Run locally with Docker Compose
 
 You need Docker Engine and Docker Compose. You do not need Java, Maven, Node,
@@ -187,15 +268,14 @@ no candidate passes confirmation; 2 for budget exhaustion, execution errors, or
 cleanup failures, invalid arguments, or an unavailable output directory; and 130
 for interruption. A cleanup failure after interruption returns 2.
 
-### Test the wrapper without a full search
+### Check the wrapper without a full search
 
 ```bash
-python3 -m unittest -v test_benchmark
 python3 benchmark.py --reuse-images --warmup-vus 50 --start-vus 50 --max-vus 100 --step 50 \
   --warmup-seconds 8 --probe-seconds 8 --confirm-seconds 10 --ramp-seconds 1 --budget-seconds 400
 ```
 
-The second command exercises containers, summary parsing, reports, and cleanup.
+This command exercises containers, summary parsing, reports, and cleanup.
 Its short confirmation is explicitly marked as a smoke test. It is not a
 performance result comparable to a 5-minute hold. See `python3 benchmark.py --help`
 for all controls.
