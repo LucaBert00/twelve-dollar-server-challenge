@@ -5,3 +5,4 @@ target/
 *.db-shm
 benchmark-results/
 __pycache__/
+.env

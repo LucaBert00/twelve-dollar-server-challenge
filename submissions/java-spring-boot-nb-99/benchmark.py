@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Warm up a running feed server, search its k6 load limit, and write reports.
 
-The caller deploys the app (directly, in Docker, or later in Kubernetes) and
+The caller deploys the app (directly, in Docker, or in Kubernetes) and
 passes its URL. This tool never starts, resets, or stops the app.
 """
 
@@ -29,6 +29,9 @@ from benchmark_report import report
 HERE = Path(__file__).resolve().parent
 WORKLOAD = HERE.parent.parent / "bench" / "load.js"
 K6_IMAGE = "grafana/k6:2.2.0@sha256:9bd01d6941fca969cb61bb57d2da5ee9b385fe2aa8881df3798c196564d6ace6"
+# --k6 exec contract: the k6 container holds load.js and tokens.json here, and
+# a writable results/ directory.
+REMOTE = Path("/work")
 CHECKS = ("feed 200", "post 200", "like 200/201", "create 201")
 THRESHOLDS = (
     ("http_req_duration", "p(95)<500", "p(95)", 500),
@@ -178,7 +181,13 @@ def execute(args, *, log=None, timeout=60, env=None):
     """Return stdout, or only the exit code when output goes to a log file."""
     if log is None:
         result = subprocess.run(
-            args, capture_output=True, text=True, timeout=timeout, check=False, env=env
+            args,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+            env=env,
         )
         if result.returncode:
             raise ExecutionError(
@@ -188,6 +197,7 @@ def execute(args, *, log=None, timeout=60, env=None):
     with open(log, "w", encoding="utf-8") as stream:
         return subprocess.run(
             args,
+            stdin=subprocess.DEVNULL,
             stdout=stream,
             stderr=subprocess.STDOUT,
             timeout=timeout,
@@ -256,7 +266,10 @@ class ProcessProbe:
 
 
 class CgroupProbe:
-    """Container modes: cgroup v2 counters read through an exec command prefix."""
+    """Container modes: cgroup v2 counters read through exec command prefixes.
+
+    Several prefixes, such as the containers of one pod, are summed.
+    """
 
     source = "container cgroup CPU, memory.current including page cache, and OOM kills"
     SCRIPT = (
@@ -265,13 +278,16 @@ class CgroupProbe:
         " && grep '^oom_kill ' memory.events"
     )
 
-    def __init__(self, prefix):
-        self.prefix = shlex.split(prefix)
+    def __init__(self, prefixes):
+        self.prefixes = [shlex.split(prefix) for prefix in prefixes]
+        self.cpu = None
 
     def limits(self):
         """Record the enforced limits, e.g. the shared VPS budget of app and Nginx."""
         script = "cd /sys/fs/cgroup && cat cpu.max memory.max && (cat memory.swap.max || echo n/a)"
-        cpu, memory, swap = execute([*self.prefix, "sh", "-c", script]).splitlines()
+        cpu, memory, swap = execute(
+            [*self.prefixes[0], "sh", "-c", script]
+        ).splitlines()
         quota, period = cpu.split()
 
         def mib(value):
@@ -284,12 +300,21 @@ class CgroupProbe:
         }
 
     def sample(self):
-        output = execute([*self.prefix, "sh", "-c", self.SCRIPT])
-        values = dict(line.split() for line in output.splitlines())
+        parts = [
+            dict(
+                line.split()
+                for line in execute([*prefix, "sh", "-c", self.SCRIPT]).splitlines()
+            )
+            for prefix in self.prefixes
+        ]
+        cpu = [int(part["usage_usec"]) / 1e6 for part in parts]
+        if self.cpu and any(now < before for now, before in zip(cpu, self.cpu)):
+            raise AppStopped("A container restarted")
+        self.cpu = cpu
         return {
-            "cpu_seconds": int(values["usage_usec"]) / 1e6,
-            "memory_mib": int(values["memory_current"]) / 1024**2,
-            "oom_kills": int(values["oom_kill"]),
+            "cpu_seconds": sum(cpu),
+            "memory_mib": sum(int(part["memory_current"]) for part in parts) / 1024**2,
+            "oom_kills": sum(int(part["oom_kill"]) for part in parts),
         }
 
 
@@ -366,6 +391,10 @@ def k6_command(args, output, container, vus, hold, stem):
         prefix = [args.k6_bin]
         results, workload = output / "k6", WORKLOAD
         variables["TOKENS"] = args.tokens.resolve()
+    elif args.k6 == "exec":
+        prefix = shlex.split(args.k6_exec) + ["k6"]
+        results, workload = REMOTE / "results", REMOTE / "load.js"
+        variables["TOKENS"] = REMOTE / "tokens.json"
     else:
         prefix = ["docker", "run", "--rm", "--name", container]
         prefix += ["--user", f"{os.getuid()}:{os.getgid()}", "-e", "NO_PROXY=*"]
@@ -394,17 +423,32 @@ def k6_command(args, output, container, vus, hold, stem):
 def arguments(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", required=True, help="Base URL checked by this tool")
-    parser.add_argument("--tokens", type=Path, required=True, help="Seed tokens.json")
+    parser.add_argument(
+        "--tokens", type=Path, help="Seed tokens.json; not used with --k6 exec"
+    )
     parser.add_argument("--mode", default="external", help="Deployment label")
-    parser.add_argument("--k6", choices=("local", "docker"), default="local")
+    parser.add_argument("--k6", choices=("local", "docker", "exec"), default="local")
     parser.add_argument("--k6-bin", default="k6", help="Local k6 executable")
+    parser.add_argument(
+        "--k6-exec",
+        help="With --k6 exec, the prefix that runs commands in a k6 container, "
+        'e.g. "kubectl exec -n NS k6 --". The container must hold /work/load.js, '
+        "/work/tokens.json, and a writable /work/results.",
+    )
     parser.add_argument("--k6-url", help="Base URL seen by k6; defaults to --url")
     parser.add_argument("--docker-network", help="Network for the k6 container")
     probe = parser.add_mutually_exclusive_group()
     probe.add_argument("--app-pid", type=int, help="Sample this host process")
     probe.add_argument(
         "--app-exec",
-        help='Sample cgroup counters through a command prefix, e.g. "docker exec ID"',
+        action="append",
+        help='Sample cgroup counters through a command prefix, e.g. "docker exec ID"; '
+        "repeat it to sum several containers",
+    )
+    parser.add_argument(
+        "--app-limits",
+        type=json.loads,
+        help="Enforced limits as JSON, when the probe cannot read them",
     )
     parser.add_argument("--output", type=Path, help="New report directory")
     parser.add_argument("--wait-seconds", type=int, default=120)
@@ -433,8 +477,10 @@ def arguments(argv=None):
         or args.max_vus % args.step
     ):
         parser.error("start/max users must be step multiples, with start <= max")
-    if not args.tokens.is_file():
+    if args.k6 != "exec" and not (args.tokens and args.tokens.is_file()):
         parser.error(f"--tokens {args.tokens} does not exist")
+    if (args.k6 == "exec") != bool(args.k6_exec):
+        parser.error("--k6-exec is required with, and only valid for, --k6 exec")
     return args
 
 
@@ -466,7 +512,7 @@ def main(argv=None):
             "mode": args.mode,
             "url": args.url,
             "k6_url": args.k6_url or args.url,
-            "k6": K6_IMAGE if args.k6 == "docker" else args.k6_bin,
+            "k6": {"docker": K6_IMAGE, "exec": args.k6_exec}.get(args.k6, args.k6_bin),
             "app_probe": probe.source if probe else None,
             "host": platform.platform(),
             "host_logical_cpus": os.cpu_count(),
@@ -498,6 +544,17 @@ def main(argv=None):
                 raise ExecutionError(
                     f"Open-file limit {files} is below {needed}; raise it or lower the user cap"
                 )
+        elif args.k6 == "exec":
+            remote = shlex.split(args.k6_exec)
+            # The container brings its own copy of the workload; it must be this one.
+            remote_sha = execute(
+                [*remote, "sha256sum", str(REMOTE / "load.js")]
+            ).split()
+            if remote_sha[:1] != [workload_sha]:
+                raise ExecutionError(
+                    "The k6 container's load.js differs from bench/load.js"
+                )
+            state["environment"]["k6"] = execute([*remote, "k6", "version"]).strip()
         else:
             try:
                 execute(["docker", "image", "inspect", K6_IMAGE])
@@ -505,7 +562,9 @@ def main(argv=None):
                 execute(["docker", "pull", "--quiet", K6_IMAGE], timeout=600)
         print(f"Waiting for {args.url}/health", flush=True)
         wait_healthy(args.url, args.wait_seconds)
-        if isinstance(probe, CgroupProbe):
+        if args.app_limits is not None:
+            state["environment"]["app_limits"] = args.app_limits
+        elif isinstance(probe, CgroupProbe):
             state["environment"]["app_limits"] = probe.limits()
         deadline = time.monotonic() + args.budget_seconds
         state["status"] = "running"
@@ -538,18 +597,30 @@ def main(argv=None):
             try:
                 if sha256(WORKLOAD) != workload_sha:
                     raise ExecutionError("The workload changed during the search")
+                if args.k6 == "exec":
+                    # A k6 whose kubectl exec stream dropped may still be sending load.
+                    execute([*remote, "sh", "-c", "pkill -x k6; true"])
                 code = execute(
                     k6_command(args, output, container, vus, hold, stem),
                     log=output / item["log"],
                     timeout=max(1, deadline - time.monotonic()),
-                    env=k6_env,
+                    # Exec mode runs kubectl, which may need a proxy; k6 then runs remotely.
+                    env=None if args.k6 == "exec" else k6_env,
                 )
                 item["exit_code"] = code
                 if code in (137, -9):
                     raise ExecutionError(
                         "k6 was killed (exit 137), usually because it ran out of memory. "
-                        "Use BENCH_K6=local, give Docker more memory, or lower BENCH_MAX_VUS."
+                        "Give k6 more memory (in Docker mode, BENCH_K6=local) or lower BENCH_MAX_VUS."
                     )
+                if args.k6 == "exec":
+                    for name in (f"{stem}.json", f"{stem}.events.jsonl"):
+                        path = REMOTE / "results" / name
+                        try:
+                            text = execute([*remote, "cat", str(path)], timeout=600)
+                        except ExecutionError:
+                            continue  # The checks below report missing output.
+                        (output / "k6" / name).write_text(text, encoding="utf-8")
                 validate_events(output / "k6" / f"{stem}.events.jsonl", code)
                 item["events"] = f"k6/{stem}.events.jsonl"
                 summary = output / "k6" / f"{stem}.json"

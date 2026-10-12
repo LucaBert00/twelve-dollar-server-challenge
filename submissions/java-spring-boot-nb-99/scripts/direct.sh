@@ -77,15 +77,6 @@ ensure_nginx() {
   NGINX=$work/nginx-1.28.0/objs/nginx
 }
 
-# wait_healthy <url> <pid>
-wait_healthy() {
-  local deadline=$((SECONDS + ${WAIT_TIMEOUT:-120}))
-  until curl -fsS --noproxy '*' --max-time 2 "$1/health" >/dev/null 2>&1; do
-    if ! kill -0 "$2" 2>/dev/null || [ "$SECONDS" -ge "$deadline" ]; then return 1; fi
-    sleep 1
-  done
-}
-
 [ -f "$here/target/server.jar" ] || { echo "target/server.jar is missing; run make build" >&2; exit 1; }
 need curl
 need python3

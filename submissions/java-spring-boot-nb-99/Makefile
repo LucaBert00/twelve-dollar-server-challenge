@@ -8,7 +8,7 @@ SOURCES := $(DIR)/pom.xml $(shell find "$(DIR)/src")
 COMPOSE := docker compose -f "$(DIR)/compose.yaml"
 NATIVE_DOCKER := export DOCKER_DEFAULT_PLATFORM="$$(docker version --format '{{.Server.Os}}/{{.Server.Arch}}')" &&
 
-# Where test-suite and benchmark run: docker (default), direct, or k8s (planned).
+# Where test-suite and benchmark run: docker (default), direct, or k8s.
 MODE ?= docker
 MAVEN ?= mvn
 MVN_ARGS ?= --batch-mode --no-transfer-progress
@@ -17,12 +17,17 @@ BUILD_IMAGES ?= true
 WAIT_TIMEOUT ?= 120
 # Where k6 runs in MODE=docker: docker (default) or local (this host).
 BENCH_K6 ?= docker
-export BUILD_IMAGES WAIT_TIMEOUT BENCH_K6
+# Image repository prefix that MODE=k8s pushes to, e.g. registry.example.com/owner.
+K8S_REGISTRY ?=
+# Existing namespace for MODE=k8s, and an optional image pull secret in it.
+K8S_NAMESPACE ?= twelve-dollar-challenge
+K8S_PULL_SECRET ?=
+export BUILD_IMAGES WAIT_TIMEOUT BENCH_K6 K8S_REGISTRY K8S_NAMESPACE K8S_PULL_SECRET
 
 BENCH_WARMUP_VUS ?= 1000
 BENCH_WARMUP_SECONDS ?= 120
 BENCH_START_VUS ?= 2500
-BENCH_MAX_VUS ?= 20000
+BENCH_MAX_VUS ?= 40000
 BENCH_STEP ?= 250
 BENCH_PROBE_SECONDS ?= 60
 BENCH_CONFIRM_SECONDS ?= 300
@@ -45,8 +50,8 @@ help:
 	@printf '%s\n' \
 	  'make build            Format check, Java tests, and target/server.jar with installed Maven' \
 	  'make test             build, then the 42-check challenge suite' \
-	  'make test-suite       Challenge suite on a fresh database (MODE=docker|direct)' \
-	  'make benchmark        Warm-up, limit search, and reports (MODE=docker|direct)' \
+	  'make test-suite       Challenge suite on a fresh database (MODE=docker|direct|k8s)' \
+	  'make benchmark        Warm-up, limit search, and reports (MODE=docker|direct|k8s)' \
 	  'make benchmark-smoke  Short benchmark run that checks the tooling, not a score' \
 	  'make report           Regenerate the latest report, or REPORT_DIR=<run directory>' \
 	  'make all              build, test-suite, and benchmark' \
@@ -58,6 +63,10 @@ help:
 	  'like the challenge VPS. BENCH_K6=local runs k6 on this host instead of in Docker.' \
 	  'MODE=direct runs Java, Nginx, and k6 on this host and downloads missing tools' \
 	  'to a temporary directory.' \
+	  'MODE=k8s pushes images to K8S_REGISTRY and runs Nginx and the app as two containers' \
+	  'of one pod sharing 1 vCPU and 2 GiB in namespace K8S_NAMESPACE of the current' \
+	  'kubectl context, pulling with K8S_PULL_SECRET if set. k6 runs in its own pod on' \
+	  'another node.' \
 	  'Benchmark settings: BENCH_WARMUP_VUS=1000 BENCH_WARMUP_SECONDS=120' \
 	  'BENCH_START_VUS=2500 BENCH_MAX_VUS=20000 BENCH_STEP=250 BENCH_PROBE_SECONDS=60' \
 	  'BENCH_CONFIRM_SECONDS=300 BENCH_CONFIRM_RUNS=1 BENCH_RAMP_SECONDS=60' \

@@ -20,6 +20,15 @@ free_port() {
   python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'
 }
 
+# wait_healthy <url> <pid>: waits until <url>/health answers while <pid> runs.
+wait_healthy() {
+  local deadline=$((SECONDS + ${WAIT_TIMEOUT:-120}))
+  until curl -fsS --noproxy '*' --max-time 2 "$1/health" >/dev/null 2>&1; do
+    if ! kill -0 "$2" 2>/dev/null || [ "$SECONDS" -ge "$deadline" ]; then return 1; fi
+    sleep 1
+  done
+}
+
 # Sets K6_BIN to an installed k6 v2, or downloads k6 2.2.0 into $work.
 ensure_k6() {
   K6_BIN=${K6_BIN:-k6}

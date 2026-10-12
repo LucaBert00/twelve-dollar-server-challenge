@@ -2,6 +2,7 @@
 !bench/
 bench/**
 !bench/nginx.conf
+!bench/load.js
 !schema.sql
 !seed/
 seed/**

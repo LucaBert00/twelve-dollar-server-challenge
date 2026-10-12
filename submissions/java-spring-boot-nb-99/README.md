@@ -19,8 +19,9 @@ and test dependencies. The POM pins the formatter and its Java formatter engine.
 ## Make workflow
 
 Run `make help` from this directory. Builds use your installed Maven and Java 25.
-The challenge suite and benchmark run in Docker by default (`MODE=docker`) or on
-this host (`MODE=direct`). Reports use local Python 3.10+. The same commands run
+The challenge suite and benchmark run in Docker by default (`MODE=docker`), on
+this host (`MODE=direct`), or in Kubernetes (`MODE=k8s`). Reports use local
+Python 3.10+. The same commands run
 natively on ARM64 Macs and AMD64 Linux.
 
 ```bash
@@ -67,8 +68,30 @@ with the system C compiler, into a temporary directory. Every download is
 checked against a pinned SHA-256. The script deletes that directory and stops
 its processes afterwards. Direct mode does not limit the app's CPU or memory.
 
-`MODE=k8s` is reserved for a kustomize deployment. `scripts/k8s.sh` describes the
-plan and currently exits with an error.
+`MODE=k8s` runs in namespace `K8S_NAMESPACE` (default `twelve-dollar-challenge`)
+of the current kubectl context. The cluster needs pod-level resources (Kubernetes
+1.34 or later). The
+script builds the app and seed images for the nodes' architectures, pushes them to
+`K8S_REGISTRY`, and applies `k8s/` with the images pinned by digest. A `server` pod
+runs Nginx and the app as separate containers, with the seed step as an init
+container. A pod-level limit makes all of them share 1 vCPU and 2 GiB. k6 runs in
+its own pod on a different node and reaches the pod through the `server` Service.
+That pod's init container takes `load.js` and the deterministic seed tokens from
+the seed image, so no files are sent through `kubectl exec`.
+A `kubectl port-forward` carries only health checks and the challenge suite, which
+runs on this host and needs curl, jq, and openssl. Each run replaces the pods, so
+it starts from a fresh database, and deletes them afterwards. The namespace must
+already exist. For a private registry, set `K8S_PULL_SECRET` to an image pull
+secret in that namespace; the script checks for it. It never deletes the
+namespace or the secret. Run `docker login` for the registry first:
+
+```bash
+make benchmark MODE=k8s K8S_REGISTRY=<registry host>/<owner> K8S_PULL_SECRET=<secret>
+```
+
+To avoid repeating these settings, copy `.env-sample` to the git-ignored `.env`.
+With [direnv](https://direnv.net), `.envrc` loads it into the environment, where
+make picks it up.
 
 Every mode picks free localhost ports, so it does not conflict with `make up`.
 
@@ -101,11 +124,13 @@ make report REPORT_DIR=benchmark-results/my-run
 
 The tool samples the app every 2 seconds during each run. Docker mode reads the
 `server` container's cgroup CPU, memory, and OOM kills, so the numbers cover the
-app and Nginx together, and records the enforced limits in the report. Direct
-mode reads the Java process's CPU time and resident memory. An app exit, restart,
-or OOM kill stops the search as an execution error, not a capacity failure. So do
-k6 errors, k6 being killed for lack of memory, missing summaries, and runs that
-miss the requested users or duration.
+app and Nginx together, and records the enforced limits in the report. Kubernetes
+mode sums the cgroups of the Nginx and app containers and records the pod-level
+limits. That sum leaves out the seed step's page cache, which still counts toward
+the pod's 2 GiB. Direct mode reads the Java process's CPU time and resident
+memory. An app exit, restart, or OOM kill stops the search as an execution error,
+not a capacity failure. So do k6 errors, k6 being killed for lack of memory,
+missing summaries, and runs that miss the requested users or duration.
 
 Each search writes to a new `benchmark-results/<run-id>/` directory, which Git
 ignores. The files update after every run:

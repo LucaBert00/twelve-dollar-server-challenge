@@ -7,4 +7,5 @@ if [ ! -f /data/feed.db ]; then
   mv /data/tokens.json.tmp /data/tokens.json
   mv /data/feed.db.tmp /data/feed.db
 fi
-chown -R 10001:10001 /data
+# Kubernetes already seeds as the app user.
+if [ "$(id -u)" = 0 ]; then chown -R 10001:10001 /data; fi
