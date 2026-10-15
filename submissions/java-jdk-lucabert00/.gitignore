@@ -1,0 +1,10 @@
+target/
+*.class
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.jfr
+*.log
+server.log
+logs/
