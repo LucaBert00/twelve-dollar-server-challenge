@@ -13,11 +13,18 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Phase 2 HTTP baseline: blocking-handler JDK {@code HttpServer} behind Nginx.
+ * Phase 3 SQLite baseline: blocking-handler JDK {@code HttpServer} behind Nginx.
  *
  * <p>Binds {@code HOST:PORT} from the environment, routes the five SPEC paths
- * to stub handlers, and answers every other path with byte-exact 404 JSON.
- * Real handler logic lands in later tickets; this module returns stubs only.
+ * to handlers, and answers every other path with byte-exact 404 JSON.
+ * Only {@code GET /health} is live in this ticket via {@link Db#checkHealth};
+ * feed, post and like handlers stay as stubs until later tickets.
+ *
+ * <p>Durability posture (SPEC Responses plus README rules 5-6): WAL with
+ * {@code synchronous=NORMAL} floor, foreign-keys-on, busy timeout 5000,
+ * enforced on every pooled connection with startup assertions on all 4 conns.
+ * Pool of 4 is the starting point, not an optimum; sizing belongs to later
+ * phases. No result caching, no table copies; schema diff stays empty.
  *
  * <p>Keep-alive posture (planning doc {@code §K}, SPEC {@code ≥65 s} rule):
  * idle lifetime is configured in {@code start.sh} via
@@ -46,7 +53,7 @@ public final class Main {
   private static final byte[] LIKE_STUB =
       "{\"liked\":true,\"already_liked\":false,\"post_id\":1}".getBytes(StandardCharsets.UTF_8);
 
-  /** Start time in millis, used for the health-stub {@code uptime_s} field. */
+  /** Start time in millis, used for the health {@code uptime_s} field. */
   private static final long START_MILLIS = System.currentTimeMillis();
 
   /** Total requests seen since start, for later benchmark columns (§3.4). */
@@ -60,14 +67,32 @@ public final class Main {
   /**
    * Bootstraps the server on {@code HOST:PORT} with the starting pool posture.
    *
+   * <p>Initializes the durable SQLite layer first and fails fast when pragma
+   * assertions do not hold; the HTTP layer starts only after the pool is
+   * proven on all 4 connections.
+   *
    * @param args command-line arguments, currently unused.
    * @throws IOException if the socket cannot be bound.
    */
   public static void main(String[] args) throws IOException {
     String host = envOr("HOST", "127.0.0.1");
     int port = Integer.parseInt(envOr("PORT", "3000"));
+    String sqlitePath = System.getenv("SQLITE_PATH");
+    if (sqlitePath == null || sqlitePath.isEmpty()) {
+      System.err.println("SQLITE_PATH must name a fresh copy of the seed database");
+      System.exit(1);
+      return;
+    }
 
     logStartupFlags();
+
+    try {
+      Db.init(sqlitePath);
+    } catch (RuntimeException e) {
+      System.err.println("DB init failed, failing fast: " + e.getMessage());
+      System.exit(1);
+      return;
+    }
 
     // Backlog 128 is the starting posture behind Nginx (notes only for direct
     // mode; DX-3 owns sizing in Phase 10). LimitNOFILE=65535 is provided by
@@ -81,6 +106,7 @@ public final class Main {
     Runtime.getRuntime().addShutdownHook(new Thread(() -> {
       server.stop(0);
       pool.shutdownNow();
+      Db.close();
     }));
     server.start();
   }
@@ -131,19 +157,75 @@ public final class Main {
   }
 
   /**
-   * Answers {@code GET /health} with a SPEC-shaped stub.
+   * Answers {@code GET /health} with a live-DB probe.
    *
-   * <p>Live DB check lands in a later ticket; this stub reports the static
-   * ok shape with real uptime.
+   * <p>Runs {@code SELECT 1} via the pooled layer: 200
+   * {@code {"status":"ok","db":"ok","uptime_s":<int>}} on success, 503
+   * {@code {"status":"degraded","db":"unreachable","error":<string>}} when the
+   * probe throws. No result caching; the probe prepares at checkout and closes
+   * per use.
    *
    * @param exchange the current HTTP exchange.
    * @throws IOException if the response cannot be sent.
    */
   private static void handleHealth(HttpExchange exchange) throws IOException {
     long uptime = (System.currentTimeMillis() - START_MILLIS) / 1000L;
+    try {
+      Db.checkHealth();
+    } catch (Exception e) {
+      String message = e.getMessage();
+      if (message == null || message.isEmpty()) {
+        message = e.getClass().getSimpleName();
+      }
+      byte[] body =
+          ("{\"status\":\"degraded\",\"db\":\"unreachable\",\"error\":\""
+                  + escapeJson(message)
+                  + "\"}")
+              .getBytes(StandardCharsets.UTF_8);
+      sendJson(exchange, 503, body);
+      return;
+    }
     byte[] body =
         ("{\"status\":\"ok\",\"db\":\"ok\",\"uptime_s\":" + uptime + "}").getBytes(StandardCharsets.UTF_8);
     sendJson(exchange, 200, body);
+  }
+
+  /**
+   * Escapes a string for embedding in compact JSON.
+   *
+   * @param value the raw string, never null.
+   * @return the escaped string without surrounding quotes.
+   */
+  private static String escapeJson(String value) {
+    StringBuilder out = new StringBuilder(value.length() + 16);
+    for (int i = 0; i < value.length(); i++) {
+      char ch = value.charAt(i);
+      switch (ch) {
+        case '"':
+          out.append("\\\"");
+          break;
+        case '\\':
+          out.append("\\\\");
+          break;
+        case '\n':
+          out.append("\\n");
+          break;
+        case '\r':
+          out.append("\\r");
+          break;
+        case '\t':
+          out.append("\\t");
+          break;
+        default:
+          if (ch < 0x20) {
+            out.append(String.format("\\u%04x", (int) ch));
+          } else {
+            out.append(ch);
+          }
+          break;
+      }
+    }
+    return out.toString();
   }
 
   /**

@@ -1,9 +1,9 @@
-# java-jdk-lucabert00 (Phase 2 baseline)
+# java-jdk-lucabert00 (Phase 3 baseline)
 
-Plain-Java baseline for Epic #13. Phase 2: blocking-handler JDK `HttpServer`
-behind Nginx with a 5-path stub router, keep-alive sized for the Nginx
-64-idle envelope, and request-logging hooks. No database code, no JWT code
-(those land in #16-#18).
+Plain-Java baseline for Epic #13. Phase 3: durable SQLite layer with WAL +
+`synchronous=NORMAL` + foreign-keys-on + `busy_timeout=5000` on every pooled
+connection, HikariCP pool of 4, live-DB `GET /health` and reference SQL.
+Feed, post and like handler logic stays stubbed (those land in #17-#18).
 
 ## Stack
 
@@ -12,10 +12,10 @@ behind Nginx with a 5-path stub router, keep-alive sized for the Nginx
 | Language | Java 25 (`maven.compiler.release=25`) |
 | JDK distribution | Eclipse Temurin `25.0.1+8` (Java 21+ is the floor, 25 is the approved line) |
 | Build tool | Maven `3.9.11` (chosen because it matches the reference build shape) |
-| SQLite driver | `org.xerial:sqlite-jdbc:3.53.4.0` (declared, not yet wired; wiring lands later) |
-| Pool | `com.zaxxer:HikariCP:6.2.1` (declared, not yet wired; pool-4 is the starting posture per OPT-07) |
+| SQLite driver | `org.xerial:sqlite-jdbc:3.53.4.0` (wired via `challenge.Db` in Phase 3) |
+| Pool | `com.zaxxer:HikariCP:6.2.1` (wired, pool of 4: starting point, not optimum, per OPT-07) |
 | Fat-jar plugin | `org.apache.maven.plugins:maven-shade-plugin:3.6.0` (build-time only) |
-| JSON library | none in Phase 2 (decision owned by #17; no Jackson here) |
+| JSON library | none in Phase 3 (decision owned by #17; no Jackson here) |
 
 ## Pins + checksums
 
@@ -39,14 +39,45 @@ Re-print pins with one command (from the repo root):
 |---|---|---|
 | `install.sh` | root, once, clean Ubuntu 24.04 | installs the pinned JDK + Maven above, verifying archive checksums; idempotent via `.installed` markers |
 | `build.sh` | normal user | `mvn clean package` with the pinned toolchain; downloads only pinned Maven Central deps; produces `target/server.jar`; no prebuilt binaries |
-| `start.sh` | normal user, foreground | `exec java -Xmx512m -Dsun.net.httpserver.idleInterval=70 -jar target/server.jar`; honors `SQLITE_PATH` / `JWT_SECRET` (required, not yet consumed) / `HOST` (default `127.0.0.1`) / `PORT` (default `3000`); `JAVA_OPTS` is the append point for later JVM flags; echoes all `sun.net.httpserver.*` flags to the startup log |
+| `start.sh` | normal user, foreground | `exec java -Xmx512m -Dsun.net.httpserver.idleInterval=70 -jar target/server.jar`; honors `SQLITE_PATH` (required, fresh DB copy) / `JWT_SECRET` (required, not yet consumed) / `HOST` (default `127.0.0.1`) / `PORT` (default `3000`); `JAVA_OPTS` is the append point for later JVM flags; echoes all `sun.net.httpserver.*` flags to the startup log |
 
-`start.sh` binds `HOST:PORT` via `challenge.Main` with a 5-path stub router
-(`GET /health`, `GET /feed`, `GET /posts/:id`, `POST /posts`,
-`POST /posts/:id/like`) plus a byte-exact `{"error":"not found"}`
-(`Content-Type: application/json`, status 404) fallback. Stub bodies are
-SPEC-shaped strings only; real logic lands in #16-#18. `SIGTERM` stops the
-server via a shutdown hook and exits `0`.
+`start.sh` binds `HOST:PORT` via `challenge.Main` with a 5-path router
+(`GET /health` live in Phase 3, `GET /feed`, `GET /posts/:id`, `POST /posts`,
+`POST /posts/:id/like` still stubbed) plus a byte-exact `{"error":"not found"}`
+(`Content-Type: application/json`, status 404) fallback. Feed/post/like real
+logic lands in #17-#18. `SIGTERM` stops the server via a shutdown hook
+(server stop + pool shutdown + `Db.close`) and exits `0`.
+
+## SQLite durability posture (Phase 3, Roadmap Phase 3)
+
+Single owner `challenge.Db`: HikariCP pool of 4 (starting point, not optimum;
+sizing belongs to later phases), driver config plus explicit per-connection
+pragma block (`journal_mode=WAL`, `synchronous=NORMAL`, `foreign_keys=ON`,
+`busy_timeout=5000`) applied on every connection acquisition. Startup asserts
+all 4 conns and fails fast when any pragma does not hold (session-only
+reversion guard); the HTTP layer starts only after `4/4 ok`.
+
+Prepared-statement posture (OPT-06): prepare at first checkout, reset + rebind
+per use. Statements are created per checkout and closed per use, which reuses
+the query plan without caching results. No response caches, no query-result
+caches, no in-memory table copies; schema diff stays empty.
+
+Reference SQL (verbatim SPEC shapes, immutable fallback for later phases) lives
+in `Db` as constants: feed correlated-count with
+`ORDER BY p.created_at DESC, p.id DESC LIMIT 20` on `posts_created_at_id_idx`,
+single-post lookup `WHERE p.id = ?`, `INSERT ... RETURNING id, created_at` and
+like upsert `ON CONFLICT (user_id, post_id) DO NOTHING`.
+
+`GET /health` runs `SELECT 1` via the pool: 200
+`{"status":"ok","db":"ok","uptime_s":<int>}` on success, 503
+`{"status":"degraded","db":"unreachable","error":<string>}` when the probe
+throws. Plan artifact: `docs/EXPLAIN_QUERY_PLAN.md` (fresh-DB baseline for DX-1).
+
+Per-variant rule carried forward: `cache_size`-class session settings drift
+per session like all pragmas, so every later variant re-asserts its pragmas
+per connection and never assumes inherited values. No `cache_size`/`mmap`/
+checkpoint knobs, no `FULL`-vs-`NORMAL` change and no pool-size sweep in this
+ticket.
 
 ## JDK HttpServer keep-alive posture (Phase 2, planning doc section K)
 
@@ -85,8 +116,9 @@ Phase 10/DX-3 (notes only here).
 
 ## Optimizations
 
-Empty until measured. No tuning in Phase 2 (minimal-diff senior-dev mode:
-smallest change that serves later phases).
+Empty until measured. No tuning in Phase 3 (minimal-diff senior-dev mode:
+smallest change that serves later phases). Pool 4, backlog 128, `-Xmx512m`
+and the pragma floor above are starting postures, explicitly not optima.
 
 ## License notices
 
@@ -94,3 +126,4 @@ smallest change that serves later phases).
 - `org.xerial:sqlite-jdbc` — Apache-2.0 (manifest-noted direct dependency).
 - `com.zaxxer:HikariCP` — Apache-2.0 (manifest-noted direct dependency).
 - Reference shape precedent only: `reference/spring-boot-pr33:submissions/java-spring-boot-nb-99/{pom.xml,install.sh,build.sh,start.sh}` (Maven + script shape, read via `git show`, never merged, nothing copied wholesale).
+- Oracle pool/pragma + SQL shapes only: `reference/spring-boot-pr33:submissions/java-spring-boot-nb-99/src/main/java/challenge/{Application.java,PostRepository.java}` (pool-4 + WAL/NORMAL/FK-ON/busy-5000 block and reference SQL, read via `git show`, never merged; re-implemented in `challenge.Db` with per-acquisition guards and startup assertions).
