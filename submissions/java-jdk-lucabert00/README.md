@@ -1,10 +1,11 @@
-# java-jdk-lucabert00 (Phase 3 baseline + T04 reads)
+# java-jdk-lucabert00 (Phase 3 baseline + T04 reads + T05 authed writes)
 
 Plain-Java baseline for Epic #13. Phase 3: durable SQLite layer with WAL +
 `synchronous=NORMAL` + foreign-keys-on + `busy_timeout=5000` on every pooled
 connection, HikariCP pool of 4, live-DB `GET /health` and reference SQL.
 T04 #17: live `GET /feed` + `GET /posts/:id` with byte-exact JSON
-(`challenge.Json`); like/create handlers stay stubbed for #18.
+(`challenge.Json`). T05 #18: HS256 per-request JWT (`challenge.Auth`) plus
+`POST /posts` and `POST /posts/:id/like` with auth-first routing.
 
 ## Stack
 
@@ -40,13 +41,13 @@ Re-print pins with one command (from the repo root):
 |---|---|---|
 | `install.sh` | root, once, clean Ubuntu 24.04 | installs the pinned JDK + Maven above, verifying archive checksums; idempotent via `.installed` markers |
 | `build.sh` | normal user | `mvn clean package` with the pinned toolchain; downloads only pinned Maven Central deps; produces `target/server.jar`; no prebuilt binaries |
-| `start.sh` | normal user, foreground | `exec java -Xmx512m -Dsun.net.httpserver.idleInterval=70 -jar target/server.jar`; honors `SQLITE_PATH` (required, fresh DB copy) / `JWT_SECRET` (required, not yet consumed) / `HOST` (default `127.0.0.1`) / `PORT` (default `3000`); `JAVA_OPTS` is the append point for later JVM flags; echoes all `sun.net.httpserver.*` flags to the startup log |
+| `start.sh` | normal user, foreground | `exec java -Xmx512m -Dsun.net.httpserver.idleInterval=70 -jar target/server.jar`; honors `SQLITE_PATH` (required, fresh DB copy) / `JWT_SECRET` (required, consumed by `challenge.Auth` on every authed request) / `HOST` (default `127.0.0.1`) / `PORT` (default `3000`); `JAVA_OPTS` is the append point for later JVM flags; echoes all `sun.net.httpserver.*` flags to the startup log |
 
 `start.sh` binds `HOST:PORT` via `challenge.Main` with a 5-path router
 (`GET /health` live since Phase 3, `GET /feed` and `GET /posts/:id` live since
-T04 #17, `POST /posts`, `POST /posts/:id/like` still stubbed) plus a byte-exact
+T04 #17, `POST /posts` and `POST /posts/:id/like` live since T05 #18) plus a byte-exact
 `{"error":"not found"}` (`Content-Type: application/json`, status 404)
-fallback. Like/create real logic lands in #18. `SIGTERM` stops the server via a shutdown hook
+fallback. `SIGTERM` stops the server via a shutdown hook
 (server stop + pool shutdown + `Db.close`) and exits `0`.
 
 ## SQLite durability posture (Phase 3, Roadmap Phase 3)
@@ -98,8 +99,9 @@ Phases 9-11).
 Router is stdlib-only with minimal-diff senior-dev mode (no framework, no
 abstractions): exact matches for `/health`, `/feed`, `/posts`, prefix shapes
 for `/posts/:id` and `/posts/:id/like`, method-gated, 404 fallback otherwise.
-Id validation for `GET /posts/:id` is live since T04 #17; auth stays out
-until #18; `POST` handlers are still stubs.
+Id validation for `GET /posts/:id` is live since T04 #17; auth-first routing
+for both `POST` routes is live since T05 #18 (`POST /posts/abc/like` without a
+token is 401, with a valid token is 400).
 
 ## Unauthenticated reads (T04, #17)
 
@@ -108,8 +110,28 @@ until #18; `POST` handlers are still stubs.
 unchanged single-post lookup; both render exact golden bytes via
 `challenge.Json`. `created_at` passes through as stored and `like_count` is
 the correlated count evaluated per request, so it reflects the database as of
-the request (like-then-read drill is SQL-level while like handlers are absent;
-full read-back proof lands with the T06 harness).
+the request (read-back `like_count:1` and top-of-feed proof land with T05).
+
+## Authed writes (T05, #18)
+
+`challenge.Auth` verifies HS256 per request with stdlib `javax.crypto.Mac`
+plus URL-base64: exact 401 shapes (`missing bearer token` / `invalid or
+expired token` / `invalid token payload`), `alg` rejection including `none`,
+`exp` enforcement, `sub` positive-integer-string + `username` string checks.
+Per-request `Mac` init is the simplest correct shape (no pooling cleverness).
+
+Per-request HMAC cost note: verification pays the full HMAC on every authed
+request by design (compliance price, never cached).
+
+`POST /posts` trims before validating, counts 500 code points (not UTF-16),
+and answers `malformed JSON body` / `body is required` /
+`body must be at most 500 characters`; success is 201 with the trimmed body,
+`like_count:0`, author from the token username, and `created_at` from the DB
+default. `POST /posts/:id/like` checks existence first (the app checks),
+answers first 201 `already_liked:false` and repeats 200 `true`, missing posts
+404, and `abc` 400 after auth. Both writes run single statements in
+auto-commit, so each commits before the response is sent (group commit is
+explicitly not here).
 
 JSON serialization decision: hand-rolled stdlib-only writer, not Jackson.
 The suite payloads are plain ASCII plus a UTF-8 round-trip check; the writer

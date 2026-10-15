@@ -22,7 +22,8 @@ import org.sqlite.SQLiteDataSource;
  * wiring, per-connection pragma block, startup assertions, SPEC reference SQL
  * constants and the live {@code SELECT 1} probe used by {@code GET /health}.
  * Feed, post read paths are live in T04 on the unchanged reference SQL shapes;
- * like and create paths land in later tickets.
+ * create and like writes land in T05 on the same reference shapes with
+ * single-statement commits before responding.
  *
  * <p>Durability posture (SPEC Responses plus README rules 5-6): WAL with
  * {@code synchronous=NORMAL} floor, commit-before-respond, no caches. Pool of
@@ -257,6 +258,75 @@ public final class Db {
           }
           return Optional.empty();
         }
+      }
+    }
+  }
+
+  /**
+   * Creates one post for {@code POST /posts}.
+   *
+   * <p>Runs the unchanged {@link #CREATE_POST_SQL} reference shape per request
+   * in auto-commit, so the row commits before the response is sent. No group
+   * commit here.
+   *
+   * @param userId the author id from the token {@code sub}.
+   * @param body the trimmed body, already validated to 1-500 code points.
+   * @param username the author name from the token, used as-is.
+   * @return the created row with {@code like_count} 0, never null.
+   * @throws SQLException when the pool is uninitialized or the insert fails.
+   */
+  public static PostRow createPost(long userId, String body, String username) throws SQLException {
+    HikariDataSource current = pool;
+    if (current == null) {
+      throw new SQLException("pool not initialized");
+    }
+    try (Connection c = current.getConnection()) {
+      applyPragmas(c);
+      try (PreparedStatement ps = c.prepareStatement(CREATE_POST_SQL)) {
+        ps.setLong(1, userId);
+        ps.setString(2, body);
+        try (ResultSet rs = ps.executeQuery()) {
+          rs.next();
+          return new PostRow(rs.getLong(1), body, rs.getString(2), username, 0);
+        }
+      }
+    }
+  }
+
+  /**
+   * Likes one post for {@code POST /posts/:id/like}.
+   *
+   * <p>Checks existence first (the app checks; SQLite FKs stay off by default
+   * elsewhere), then runs the unchanged {@link #LIKE_UPSERT_SQL} reference
+   * shape per request in auto-commit, so the write commits before the response
+   * is sent. No group commit here.
+   *
+   * @param userId the liking user id from the token {@code sub}.
+   * @param postId the post id, already validated as a positive integer.
+   * @return empty when the post does not exist, otherwise true on repeats and
+   *     false on the first like.
+   * @throws SQLException when the pool is uninitialized or a query fails.
+   */
+  public static Optional<Boolean> likePost(long userId, long postId) throws SQLException {
+    HikariDataSource current = pool;
+    if (current == null) {
+      throw new SQLException("pool not initialized");
+    }
+    try (Connection c = current.getConnection()) {
+      applyPragmas(c);
+      try (PreparedStatement check = c.prepareStatement("SELECT count(*) FROM posts WHERE id = ?")) {
+        check.setLong(1, postId);
+        try (ResultSet rs = check.executeQuery()) {
+          rs.next();
+          if (rs.getInt(1) == 0) {
+            return Optional.empty();
+          }
+        }
+      }
+      try (PreparedStatement up = c.prepareStatement(LIKE_UPSERT_SQL)) {
+        up.setLong(1, userId);
+        up.setLong(2, postId);
+        return Optional.of(up.executeUpdate() == 0);
       }
     }
   }

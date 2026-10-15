@@ -110,6 +110,25 @@ public final class Json {
   }
 
   /**
+   * Renders the like response with exact SPEC key order.
+   *
+   * @param liked always true per SPEC.
+   * @param alreadyLiked true on repeats, false on the first like.
+   * @param postId the liked post id.
+   * @return the exact like response bytes.
+   */
+  public static byte[] like(boolean liked, boolean alreadyLiked, long postId) {
+    return ("{\"liked\":"
+            + liked
+            + ",\"already_liked\":"
+            + alreadyLiked
+            + ",\"post_id\":"
+            + postId
+            + "}")
+        .getBytes(StandardCharsets.UTF_8);
+  }
+
+  /**
    * Renders the error shape for a fixed SPEC message.
    *
    * @param message the exact error message, never null.

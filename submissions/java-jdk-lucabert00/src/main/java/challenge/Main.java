@@ -13,13 +13,14 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Phase 3 SQLite baseline: blocking-handler JDK {@code HttpServer} behind Nginx.
+ * Phase 3 SQLite baseline plus T04 reads and T05 authed writes.
  *
  * <p>Binds {@code HOST:PORT} from the environment, routes the five SPEC paths
  * to handlers, and answers every other path with byte-exact 404 JSON.
  * {@code GET /health} probes the live DB; {@code GET /feed} and
- * {@code GET /posts/:id} serve live read paths in T04. Like and create
- * handlers stay as stubs until later tickets.
+ * {@code GET /posts/:id} serve live read paths (T04 byte-exact, untouched by
+ * T05); {@code POST /posts} and {@code POST /posts/:id/like} verify HS256 JWTs
+ * per request and serve the write paths (T05) with auth-first routing.
  *
  * <p>Durability posture (SPEC Responses plus README rules 5-6): WAL with
  * {@code synchronous=NORMAL} floor, foreign-keys-on, busy timeout 5000,
@@ -52,11 +53,6 @@ public final class Main {
       "{\"error\":\"post not found\"}".getBytes(StandardCharsets.UTF_8);
   private static final byte[] INTERNAL_ERROR =
       "{\"error\":\"internal server error\"}".getBytes(StandardCharsets.UTF_8);
-  private static final byte[] POST_STUB =
-      "{\"post\":{\"id\":1,\"body\":\"\",\"created_at\":\"2025-12-31T23:59:19.409Z\",\"author\":\"\",\"like_count\":0}}"
-          .getBytes(StandardCharsets.UTF_8);
-  private static final byte[] LIKE_STUB =
-      "{\"liked\":true,\"already_liked\":false,\"post_id\":1}".getBytes(StandardCharsets.UTF_8);
 
   /** Start time in millis, used for the health {@code uptime_s} field. */
   private static final long START_MILLIS = System.currentTimeMillis();
@@ -72,9 +68,10 @@ public final class Main {
   /**
    * Bootstraps the server on {@code HOST:PORT} with the starting pool posture.
    *
-   * <p>Initializes the durable SQLite layer first and fails fast when pragma
-   * assertions do not hold; the HTTP layer starts only after the pool is
-   * proven on all 4 connections.
+   * <p>Initializes the durable SQLite layer plus the JWT verifier first and
+   * fails fast when pragma assertions do not hold or the JWT secret is
+   * missing; the HTTP layer starts only after the pool is proven on all 4
+   * connections.
    *
    * @param args command-line arguments, currently unused.
    * @throws IOException if the socket cannot be bound.
@@ -85,6 +82,19 @@ public final class Main {
     String sqlitePath = System.getenv("SQLITE_PATH");
     if (sqlitePath == null || sqlitePath.isEmpty()) {
       System.err.println("SQLITE_PATH must name a fresh copy of the seed database");
+      System.exit(1);
+      return;
+    }
+    String jwtSecret = System.getenv("JWT_SECRET");
+    if (jwtSecret == null || jwtSecret.isEmpty()) {
+      System.err.println("JWT_SECRET must not be empty");
+      System.exit(1);
+      return;
+    }
+    try {
+      Auth.init(jwtSecret);
+    } catch (RuntimeException e) {
+      System.err.println("Auth init failed, failing fast: " + e.getMessage());
       System.exit(1);
       return;
     }
@@ -132,7 +142,10 @@ public final class Main {
   }
 
   /**
-   * Routes one exchange to its stub handler or the 404 fallback.
+   * Routes one exchange to its handler or the 404 fallback.
+   *
+   * <p>Authed routes verify the JWT before any id or body checks
+   * (auth-before-id).
    *
    * @param exchange the current HTTP exchange.
    * @throws IOException if the response cannot be sent.
@@ -151,11 +164,9 @@ public final class Main {
     } else if ("GET".equals(method) && isSinglePostPath(path)) {
       handlePost(exchange, path);
     } else if ("POST".equals(method) && "/posts".equals(path)) {
-      drainRequestBody(exchange);
-      sendJson(exchange, 201, POST_STUB);
+      handleCreate(exchange);
     } else if ("POST".equals(method) && isLikePath(path)) {
-      drainRequestBody(exchange);
-      sendJson(exchange, 201, LIKE_STUB);
+      handleLike(exchange, path);
     } else {
       handleNotFound(exchange);
     }
@@ -244,6 +255,107 @@ public final class Main {
   }
 
   /**
+   * Answers {@code POST /posts} with trim-then-validate creation.
+   *
+   * <p>Auth runs first; then the JSON body is parsed ({@code malformed JSON
+   * body}), the {@code body} field must be a string that is non-empty after
+   * {@code strip()} ({@code body is required}) and at most 500 code points
+   * after trim ({@code body must be at most 500 characters}). Success inserts
+   * via the reference SQL in auto-commit (commit before respond) and answers
+   * 201 with the trimmed body, token username, and {@code like_count:0}.
+   *
+   * @param exchange the current HTTP exchange.
+   * @throws IOException if the response cannot be sent.
+   */
+  private static void handleCreate(HttpExchange exchange) throws IOException {
+    Auth.User user;
+    try {
+      user = Auth.authenticate(exchange.getRequestHeaders().getFirst("Authorization"));
+    } catch (Auth.AuthException e) {
+      drainRequestBody(exchange);
+      sendJson(exchange, 401, Json.error(e.getMessage()));
+      return;
+    }
+    byte[] raw;
+    try (InputStream in = exchange.getRequestBody()) {
+      raw = in.readAllBytes();
+    } catch (IOException e) {
+      sendJson(exchange, 400, Json.error("malformed JSON body"));
+      return;
+    }
+    java.util.Map<String, Object> obj;
+    try {
+      obj = Auth.parseObject(new String(raw, StandardCharsets.UTF_8));
+    } catch (IllegalArgumentException e) {
+      sendJson(exchange, 400, Json.error("malformed JSON body"));
+      return;
+    }
+    Object value = obj.get("body");
+    if (!(value instanceof String)) {
+      sendJson(exchange, 400, Json.error("body is required"));
+      return;
+    }
+    String trimmed = ((String) value).strip();
+    if (trimmed.isEmpty()) {
+      sendJson(exchange, 400, Json.error("body is required"));
+      return;
+    }
+    if (trimmed.codePointCount(0, trimmed.length()) > 500) {
+      sendJson(exchange, 400, Json.error("body must be at most 500 characters"));
+      return;
+    }
+    try {
+      var row = Db.createPost(user.id(), trimmed, user.username());
+      sendJson(exchange, 201, Json.singlePost(row));
+    } catch (Exception e) {
+      sendJson(exchange, 500, INTERNAL_ERROR);
+    }
+  }
+
+  /**
+   * Answers {@code POST /posts/:id/like} with idempotent likes.
+   *
+   * <p>Auth runs before id validation: without a token the answer is 401 even
+   * for {@code abc}; with a valid token a bad id is 400. Missing posts are 404
+   * (the app checks existence). The first like is 201 with
+   * {@code already_liked:false}, repeats are 200 with {@code true}. Each write
+   * commits in auto-commit before the response is sent.
+   *
+   * @param exchange the current HTTP exchange.
+   * @param path the request path, already known to have the like shape.
+   * @throws IOException if the response cannot be sent.
+   */
+  private static void handleLike(HttpExchange exchange, String path) throws IOException {
+    Auth.User user;
+    try {
+      user = Auth.authenticate(exchange.getRequestHeaders().getFirst("Authorization"));
+    } catch (Auth.AuthException e) {
+      drainRequestBody(exchange);
+      sendJson(exchange, 401, Json.error(e.getMessage()));
+      return;
+    }
+    String raw = path.substring("/posts/".length(), path.length() - "/like".length());
+    long id = parsePostId(raw);
+    if (id < 1) {
+      drainRequestBody(exchange);
+      sendJson(exchange, 400, INVALID_POST_ID);
+      return;
+    }
+    drainRequestBody(exchange);
+    try {
+      var result = Db.likePost(user.id(), id);
+      if (result.isEmpty()) {
+        sendJson(exchange, 404, POST_NOT_FOUND);
+        return;
+      }
+      boolean alreadyLiked = result.get();
+      sendJson(exchange, alreadyLiked ? 200 : 201, Json.like(true, alreadyLiked, id));
+    } catch (Exception e) {
+      sendJson(exchange, 500, INTERNAL_ERROR);
+    }
+  }
+
+  /**
    * Parses a raw post id segment into a positive integer.
    *
    * <p>Out-of-scope choice (SPEC tests only {@code 0,-1,abc,1.5} plus a large
@@ -303,7 +415,8 @@ public final class Main {
   /**
    * Checks whether a path is a like shape ({@code /posts/<id>/like}).
    *
-   * <p>Stub routing only: no id or auth checks here.
+   * <p>Shape routing only: auth runs first in {@link #handleLike}, then id
+   * validation, then the existence check.
    *
    * @param path the request path, never null.
    * @return true when the path has the like shape.
@@ -325,7 +438,7 @@ public final class Main {
     try (InputStream in = exchange.getRequestBody()) {
       in.readAllBytes();
     } catch (IOException ignored) {
-      // Stub handlers ignore body errors; the response still carries the stub.
+      // Body errors never change the already-chosen response.
     }
   }
 
