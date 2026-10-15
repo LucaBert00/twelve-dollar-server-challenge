@@ -11,6 +11,7 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 import org.sqlite.SQLiteConfig;
 import org.sqlite.SQLiteDataSource;
 
@@ -20,8 +21,8 @@ import org.sqlite.SQLiteDataSource;
  * <p>Single clear owner for all data-access posture in Phase 3: HikariCP pool
  * wiring, per-connection pragma block, startup assertions, SPEC reference SQL
  * constants and the live {@code SELECT 1} probe used by {@code GET /health}.
- * Feed, post and like handler logic lands in later tickets; this module holds
- * only the SQL shapes they will reuse.
+ * Feed, post read paths are live in T04 on the unchanged reference SQL shapes;
+ * like and create paths land in later tickets.
  *
  * <p>Durability posture (SPEC Responses plus README rules 5-6): WAL with
  * {@code synchronous=NORMAL} floor, commit-before-respond, no caches. Pool of
@@ -88,6 +89,17 @@ public final class Db {
 
   /** Liveness probe used by {@code GET /health}. */
   public static final String HEALTH_SQL = "SELECT 1";
+
+  /**
+   * One post row as the read handlers consume it.
+   *
+   * @param id the post id.
+   * @param body the post body text as stored.
+   * @param createdAt the stored timestamp text, passed through untouched.
+   * @param author the post author's username.
+   * @param likeCount the live like count as of this request.
+   */
+  public record PostRow(long id, String body, String createdAt, String author, long likeCount) {}
 
   private static volatile HikariDataSource pool;
 
@@ -190,6 +202,74 @@ public final class Db {
         }
       }
     }
+  }
+
+  /**
+   * Reads the 20 newest posts for {@code GET /feed}.
+   *
+   * <p>Runs the unchanged {@link #FEED_SQL} reference shape per request, so
+   * {@code like_count} reflects the database as of this request. No result
+   * caching; the statement prepares at checkout and closes per use.
+   *
+   * @return the 20 newest rows in wire order, never null.
+   * @throws SQLException when the pool is uninitialized or the query fails.
+   */
+  public static List<PostRow> feed() throws SQLException {
+    HikariDataSource current = pool;
+    if (current == null) {
+      throw new SQLException("pool not initialized");
+    }
+    try (Connection c = current.getConnection()) {
+      applyPragmas(c);
+      try (PreparedStatement ps = c.prepareStatement(FEED_SQL);
+          ResultSet rs = ps.executeQuery()) {
+        List<PostRow> out = new ArrayList<>(20);
+        while (rs.next()) {
+          out.add(mapPost(rs));
+        }
+        return out;
+      }
+    }
+  }
+
+  /**
+   * Reads one post by id for {@code GET /posts/:id}.
+   *
+   * <p>Runs the unchanged {@link #GET_POST_SQL} reference shape per request,
+   * so {@code like_count} reflects the database as of this request.
+   *
+   * @param id the post id, already validated as a positive integer.
+   * @return the row, or empty when the post does not exist.
+   * @throws SQLException when the pool is uninitialized or the query fails.
+   */
+  public static Optional<PostRow> getPost(long id) throws SQLException {
+    HikariDataSource current = pool;
+    if (current == null) {
+      throw new SQLException("pool not initialized");
+    }
+    try (Connection c = current.getConnection()) {
+      applyPragmas(c);
+      try (PreparedStatement ps = c.prepareStatement(GET_POST_SQL)) {
+        ps.setLong(1, id);
+        try (ResultSet rs = ps.executeQuery()) {
+          if (rs.next()) {
+            return Optional.of(mapPost(rs));
+          }
+          return Optional.empty();
+        }
+      }
+    }
+  }
+
+  /**
+   * Maps the current result row to a post row.
+   *
+   * @param rs the result positioned on a post row.
+   * @return the mapped row, never null.
+   * @throws SQLException when a column cannot be read.
+   */
+  private static PostRow mapPost(ResultSet rs) throws SQLException {
+    return new PostRow(rs.getLong(1), rs.getString(2), rs.getString(3), rs.getString(4), rs.getLong(5));
   }
 
   /**

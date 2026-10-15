@@ -1,9 +1,10 @@
-# java-jdk-lucabert00 (Phase 3 baseline)
+# java-jdk-lucabert00 (Phase 3 baseline + T04 reads)
 
 Plain-Java baseline for Epic #13. Phase 3: durable SQLite layer with WAL +
 `synchronous=NORMAL` + foreign-keys-on + `busy_timeout=5000` on every pooled
 connection, HikariCP pool of 4, live-DB `GET /health` and reference SQL.
-Feed, post and like handler logic stays stubbed (those land in #17-#18).
+T04 #17: live `GET /feed` + `GET /posts/:id` with byte-exact JSON
+(`challenge.Json`); like/create handlers stay stubbed for #18.
 
 ## Stack
 
@@ -15,7 +16,7 @@ Feed, post and like handler logic stays stubbed (those land in #17-#18).
 | SQLite driver | `org.xerial:sqlite-jdbc:3.53.4.0` (wired via `challenge.Db` in Phase 3) |
 | Pool | `com.zaxxer:HikariCP:6.2.1` (wired, pool of 4: starting point, not optimum, per OPT-07) |
 | Fat-jar plugin | `org.apache.maven.plugins:maven-shade-plugin:3.6.0` (build-time only) |
-| JSON library | none in Phase 3 (decision owned by #17; no Jackson here) |
+| JSON library | hand-rolled stdlib writer (`challenge.Json`, T04 #17 decision below; no Jackson) |
 
 ## Pins + checksums
 
@@ -42,10 +43,10 @@ Re-print pins with one command (from the repo root):
 | `start.sh` | normal user, foreground | `exec java -Xmx512m -Dsun.net.httpserver.idleInterval=70 -jar target/server.jar`; honors `SQLITE_PATH` (required, fresh DB copy) / `JWT_SECRET` (required, not yet consumed) / `HOST` (default `127.0.0.1`) / `PORT` (default `3000`); `JAVA_OPTS` is the append point for later JVM flags; echoes all `sun.net.httpserver.*` flags to the startup log |
 
 `start.sh` binds `HOST:PORT` via `challenge.Main` with a 5-path router
-(`GET /health` live in Phase 3, `GET /feed`, `GET /posts/:id`, `POST /posts`,
-`POST /posts/:id/like` still stubbed) plus a byte-exact `{"error":"not found"}`
-(`Content-Type: application/json`, status 404) fallback. Feed/post/like real
-logic lands in #17-#18. `SIGTERM` stops the server via a shutdown hook
+(`GET /health` live since Phase 3, `GET /feed` and `GET /posts/:id` live since
+T04 #17, `POST /posts`, `POST /posts/:id/like` still stubbed) plus a byte-exact
+`{"error":"not found"}` (`Content-Type: application/json`, status 404)
+fallback. Like/create real logic lands in #18. `SIGTERM` stops the server via a shutdown hook
 (server stop + pool shutdown + `Db.close`) and exits `0`.
 
 ## SQLite durability posture (Phase 3, Roadmap Phase 3)
@@ -97,7 +98,33 @@ Phases 9-11).
 Router is stdlib-only with minimal-diff senior-dev mode (no framework, no
 abstractions): exact matches for `/health`, `/feed`, `/posts`, prefix shapes
 for `/posts/:id` and `/posts/:id/like`, method-gated, 404 fallback otherwise.
-No id validation, no auth, no JSON library (stub strings only).
+Id validation for `GET /posts/:id` is live since T04 #17; auth stays out
+until #18; `POST` handlers are still stubs.
+
+## Unauthenticated reads (T04, #17)
+
+`GET /feed` runs the unchanged reference feed SQL per request (20 newest,
+`ORDER BY p.created_at DESC, p.id DESC`) and `GET /posts/:id` runs the
+unchanged single-post lookup; both render exact golden bytes via
+`challenge.Json`. `created_at` passes through as stored and `like_count` is
+the correlated count evaluated per request, so it reflects the database as of
+the request (like-then-read drill is SQL-level while like handlers are absent;
+full read-back proof lands with the T06 harness).
+
+JSON serialization decision: hand-rolled stdlib-only writer, not Jackson.
+The suite payloads are plain ASCII plus a UTF-8 round-trip check; the writer
+escapes `"`, `\` and control characters and passes everything else (including
+`<>&/`, café/emoji) through raw UTF-8, which is all the goldens need. No new
+dependency, smallest diff; Jackson (Apache-2.0, manifest-noted) stays the
+correctness-first fallback if a later profile (Phase 11 OPT-23) indicts the
+writer — no serialization tuning in this ticket.
+
+Id validation: digits-only fitting in a `long` with value ≥ 1 wins
+(`0`, `-1`, `abc`, `1.5` → 400 `invalid post id`; well-formed but absent →
+404 `post not found`). Out-of-scope choices (SPEC: do whatever the framework
+does): leading zeros resolve numerically (`01` reads post 1), digit strings
+overflowing `long` read as invalid, and wrong methods on known paths plus
+unknown paths keep the T02 404 `{"error":"not found"}` fallback unchanged.
 
 Request-logging hooks for later benchmark columns (§3.4): total-request
 counter, per-status counters, and a one-line `METHOD path -> status` log.
@@ -127,3 +154,4 @@ and the pragma floor above are starting postures, explicitly not optima.
 - `com.zaxxer:HikariCP` — Apache-2.0 (manifest-noted direct dependency).
 - Reference shape precedent only: `reference/spring-boot-pr33:submissions/java-spring-boot-nb-99/{pom.xml,install.sh,build.sh,start.sh}` (Maven + script shape, read via `git show`, never merged, nothing copied wholesale).
 - Oracle pool/pragma + SQL shapes only: `reference/spring-boot-pr33:submissions/java-spring-boot-nb-99/src/main/java/challenge/{Application.java,PostRepository.java}` (pool-4 + WAL/NORMAL/FK-ON/busy-5000 block and reference SQL, read via `git show`, never merged; re-implemented in `challenge.Db` with per-acquisition guards and startup assertions).
+- Oracle JSON/error shapes only: `reference/spring-boot-pr33:submissions/java-spring-boot-nb-99/src/main/java/challenge/{Responses.java,ErrorHandler.java}` (key-order discipline, error shapes, read via `git show`, never merged; re-implemented in `challenge.Json` with no Jackson dependency).

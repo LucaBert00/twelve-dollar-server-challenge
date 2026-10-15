@@ -17,8 +17,9 @@ import java.util.concurrent.atomic.AtomicLong;
  *
  * <p>Binds {@code HOST:PORT} from the environment, routes the five SPEC paths
  * to handlers, and answers every other path with byte-exact 404 JSON.
- * Only {@code GET /health} is live in this ticket via {@link Db#checkHealth};
- * feed, post and like handlers stay as stubs until later tickets.
+ * {@code GET /health} probes the live DB; {@code GET /feed} and
+ * {@code GET /posts/:id} serve live read paths in T04. Like and create
+ * handlers stay as stubs until later tickets.
  *
  * <p>Durability posture (SPEC Responses plus README rules 5-6): WAL with
  * {@code synchronous=NORMAL} floor, foreign-keys-on, busy timeout 5000,
@@ -45,8 +46,12 @@ import java.util.concurrent.atomic.AtomicLong;
 public final class Main {
 
   private static final byte[] NOT_FOUND = "{\"error\":\"not found\"}".getBytes(StandardCharsets.UTF_8);
-  private static final byte[] FEED_STUB =
-      "{\"posts\":[]}".getBytes(StandardCharsets.UTF_8);
+  private static final byte[] INVALID_POST_ID =
+      "{\"error\":\"invalid post id\"}".getBytes(StandardCharsets.UTF_8);
+  private static final byte[] POST_NOT_FOUND =
+      "{\"error\":\"post not found\"}".getBytes(StandardCharsets.UTF_8);
+  private static final byte[] INTERNAL_ERROR =
+      "{\"error\":\"internal server error\"}".getBytes(StandardCharsets.UTF_8);
   private static final byte[] POST_STUB =
       "{\"post\":{\"id\":1,\"body\":\"\",\"created_at\":\"2025-12-31T23:59:19.409Z\",\"author\":\"\",\"like_count\":0}}"
           .getBytes(StandardCharsets.UTF_8);
@@ -142,9 +147,9 @@ public final class Main {
     if ("GET".equals(method) && "/health".equals(path)) {
       handleHealth(exchange);
     } else if ("GET".equals(method) && "/feed".equals(path)) {
-      sendJson(exchange, 200, FEED_STUB);
+      handleFeed(exchange);
     } else if ("GET".equals(method) && isSinglePostPath(path)) {
-      sendJson(exchange, 200, POST_STUB);
+      handlePost(exchange, path);
     } else if ("POST".equals(method) && "/posts".equals(path)) {
       drainRequestBody(exchange);
       sendJson(exchange, 201, POST_STUB);
@@ -179,7 +184,7 @@ public final class Main {
       }
       byte[] body =
           ("{\"status\":\"degraded\",\"db\":\"unreachable\",\"error\":\""
-                  + escapeJson(message)
+                  + Json.quote(message)
                   + "\"}")
               .getBytes(StandardCharsets.UTF_8);
       sendJson(exchange, 503, body);
@@ -191,41 +196,80 @@ public final class Main {
   }
 
   /**
-   * Escapes a string for embedding in compact JSON.
+   * Answers {@code GET /feed} with the 20 newest posts.
    *
-   * @param value the raw string, never null.
-   * @return the escaped string without surrounding quotes.
+   * <p>Runs the reference feed query per request with exact golden bytes via
+   * {@link Json#feed}. Any failure becomes 500 {@code internal server error}.
+   *
+   * @param exchange the current HTTP exchange.
+   * @throws IOException if the response cannot be sent.
    */
-  private static String escapeJson(String value) {
-    StringBuilder out = new StringBuilder(value.length() + 16);
-    for (int i = 0; i < value.length(); i++) {
-      char ch = value.charAt(i);
-      switch (ch) {
-        case '"':
-          out.append("\\\"");
-          break;
-        case '\\':
-          out.append("\\\\");
-          break;
-        case '\n':
-          out.append("\\n");
-          break;
-        case '\r':
-          out.append("\\r");
-          break;
-        case '\t':
-          out.append("\\t");
-          break;
-        default:
-          if (ch < 0x20) {
-            out.append(String.format("\\u%04x", (int) ch));
-          } else {
-            out.append(ch);
-          }
-          break;
+  private static void handleFeed(HttpExchange exchange) throws IOException {
+    try {
+      sendJson(exchange, 200, Json.feed(Db.feed()));
+    } catch (Exception e) {
+      sendJson(exchange, 500, INTERNAL_ERROR);
+    }
+  }
+
+  /**
+   * Answers {@code GET /posts/:id} with one post or an id error.
+   *
+   * <p>Non-positive-integer ids ({@code 0}, {@code -1}, {@code abc},
+   * {@code 1.5}) become 400 {@code invalid post id}; a well-formed but absent
+   * id becomes 404 {@code post not found}; otherwise the exact golden bytes
+   * via {@link Json#singlePost}. Any failure becomes 500
+   * {@code internal server error}.
+   *
+   * @param exchange the current HTTP exchange.
+   * @param path the request path, already known to have the single-post shape.
+   * @throws IOException if the response cannot be sent.
+   */
+  private static void handlePost(HttpExchange exchange, String path) throws IOException {
+    long id = parsePostId(path.substring("/posts/".length()));
+    if (id < 1) {
+      sendJson(exchange, 400, INVALID_POST_ID);
+      return;
+    }
+    try {
+      var row = Db.getPost(id);
+      if (row.isEmpty()) {
+        sendJson(exchange, 404, POST_NOT_FOUND);
+        return;
+      }
+      sendJson(exchange, 200, Json.singlePost(row.get()));
+    } catch (Exception e) {
+      sendJson(exchange, 500, INTERNAL_ERROR);
+    }
+  }
+
+  /**
+   * Parses a raw post id segment into a positive integer.
+   *
+   * <p>Out-of-scope choice (SPEC tests only {@code 0,-1,abc,1.5} plus a large
+   * missing id): digits-only and fitting in a {@code long} with value at least
+   * 1 wins; leading zeros resolve to their numeric value ({@code 01} reads
+   * post 1) and digit strings overflowing {@code long} read as invalid.
+   *
+   * @param raw the raw id segment, never null.
+   * @return the id, or -1 when it is not a positive integer.
+   */
+  private static long parsePostId(String raw) {
+    if (raw.isEmpty()) {
+      return -1;
+    }
+    for (int i = 0; i < raw.length(); i++) {
+      char ch = raw.charAt(i);
+      if (ch < '0' || ch > '9') {
+        return -1;
       }
     }
-    return out.toString();
+    try {
+      long id = Long.parseLong(raw);
+      return id >= 1 ? id : -1;
+    } catch (NumberFormatException e) {
+      return -1;
+    }
   }
 
   /**
@@ -242,8 +286,8 @@ public final class Main {
   /**
    * Checks whether a path is a single-post shape ({@code /posts/<id>}).
    *
-   * <p>Stub routing only: no id validation here (later tickets own the
-   * {@code invalid post id} matrix). Matches exactly two segments.
+   * <p>Shape routing only: id validation lives in {@link #handlePost}, which
+   * answers the {@code invalid post id} matrix. Matches exactly two segments.
    *
    * @param path the request path, never null.
    * @return true when the path has the single-post shape.
