@@ -13,6 +13,7 @@
     <maven.compiler.release>25</maven.compiler.release>
     <sqlite-jdbc.version>3.53.4.0</sqlite-jdbc.version>
     <hikaricp.version>6.2.1</hikaricp.version>
+    <junit-jupiter.version>5.13.4</junit-jupiter.version>
   </properties>
 
   <dependencies>
@@ -25,6 +26,24 @@
       <groupId>com.zaxxer</groupId>
       <artifactId>HikariCP</artifactId>
       <version>${hikaricp.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter-api</artifactId>
+      <version>${junit-jupiter.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter-params</artifactId>
+      <version>${junit-jupiter.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter-engine</artifactId>
+      <version>${junit-jupiter.version}</version>
+      <scope>test</scope>
     </dependency>
   </dependencies>
 

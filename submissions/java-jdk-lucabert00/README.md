@@ -1,4 +1,4 @@
-# java-jdk-lucabert00 (Phase 3 baseline + T04 reads + T05 authed writes)
+# java-jdk-lucabert00 (Phase 3 baseline + T04 reads + T05 authed writes + T06 gate)
 
 Plain-Java baseline for Epic #13. Phase 3: durable SQLite layer with WAL +
 `synchronous=NORMAL` + foreign-keys-on + `busy_timeout=5000` on every pooled
@@ -6,6 +6,9 @@ connection, HikariCP pool of 4, live-DB `GET /health` and reference SQL.
 T04 #17: live `GET /feed` + `GET /posts/:id` with byte-exact JSON
 (`challenge.Json`). T05 #18: HS256 per-request JWT (`challenge.Auth`) plus
 `POST /posts` and `POST /posts/:id/like` with auth-first routing.
+T06 #19: official correctness (Gate D) — JUnit gate harness + fresh-DB
+discipline + signed rule 5/6 checklist + oracle spot-diff vs C-pin `7a9cb99`.
+Handlers from #17/#18 stay byte-exact (untouched).
 
 ## Stack
 
@@ -168,6 +171,16 @@ Phase 10/DX-3 (notes only here).
 Empty until measured. No tuning in Phase 3 (minimal-diff senior-dev mode:
 smallest change that serves later phases). Pool 4, backlog 128, `-Xmx512m`
 and the pragma floor above are starting postures, explicitly not optima.
+
+## Official correctness (T06, #19, Gate D)
+
+JUnit harness under `src/test/java/challenge/` (`*Test`, AAA,
+`@ParameterizedTest` id + auth matrices, `@Tag("gate")` vs `@Tag("bench")`);
+`mvn test` runs the gate tags green (report: `target/surefire-reports/`).
+Fresh-DB discipline, signed rule 5/6 checklist and oracle spot-diff live in
+`docs/GATE.md`, `docs/CHECKLIST.md`, `docs/ORACLE_DIFF.md`. Verification is
+`bash test/run.sh submissions/java-jdk-lucabert00` (what CI runs). No
+benchmarking, no tuning, no lane changes here; handlers stay byte-exact.
 
 ## License notices
 
