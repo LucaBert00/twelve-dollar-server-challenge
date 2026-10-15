@@ -1496,7 +1496,7 @@ exactly, in order, and stop before implementation.
 Published 2026-10-14 on `LucaBert00/twelve-dollar-server-challenge`,
 milestone `Task-3-Java-Baseline`
 (`https://github.com/LucaBert00/twelve-dollar-server-challenge/milestone/2`).
-T06–T08 reserved for a later session (not created here).
+T06–T08 published 2026-10-15 (#19–#21).
 
 | Planning ID | Issue | Title |
 |---|---|---|
@@ -1506,10 +1506,10 @@ T06–T08 reserved for a later session (not created here).
 | `T03` | [#16](https://github.com/LucaBert00/twelve-dollar-server-challenge/issues/16) | `[Wayfinder-3/8] SQLite integration, pragmas, live health` |
 | `T04` | [#17](https://github.com/LucaBert00/twelve-dollar-server-challenge/issues/17) | `[Wayfinder-4/8] Unauthenticated API: feed, single post, JSON exactness` |
 | `T05` | [#18](https://github.com/LucaBert00/twelve-dollar-server-challenge/issues/18) | `[Wayfinder-5/8] JWT auth plus post creation and likes` |
-| `T06` | reserved | `[Wayfinder-6/8] Official correctness: suite green, harness, oracle diff` |
-| `T07` | reserved | `[Wayfinder-7/8] Benchmark readiness: deploy, startup, seed, limits` |
-| `T08` | reserved | `[Wayfinder-8/8] First reproducible benchmark (S0–S4 + J11 table)` |
+| `T06` | [#19](https://github.com/LucaBert00/twelve-dollar-server-challenge/issues/19) | `[Wayfinder-6/8] Official correctness: suite green, harness, oracle diff` |
+| `T07` | [#20](https://github.com/LucaBert00/twelve-dollar-server-challenge/issues/20) | `[Wayfinder-7/8] Benchmark readiness: deploy, startup, seed, limits` |
+| `T08` | [#21](https://github.com/LucaBert00/twelve-dollar-server-challenge/issues/21) | `[Wayfinder-8/8] First reproducible benchmark (S0–S4 + J11 table)` |
 
-Dependency chain as published: #14 → #15 → #16 → #17 → #18 → T06
-(reserved). Epic #13 children: #14–#18 (body refs; native sub-issue API
+Dependency chain as published: #14 → #15 → #16 → #17 → #18 → #19 → #20 → #21.
+Epic #13 children: #14–#21 (body refs; native sub-issue API
 returned 404, same fallback as the previous map).
