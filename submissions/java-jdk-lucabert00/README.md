@@ -1,8 +1,9 @@
-# java-jdk-lucabert00 (Phase 1 skeleton)
+# java-jdk-lucabert00 (Phase 2 baseline)
 
-Plain-Java baseline skeleton for Epic #13. Phase 1 only: pinned toolchain,
-lifecycle scripts, and a 404-only JDK `HttpServer`. No endpoint logic, no
-database code, no JWT code (those land in #15-#18).
+Plain-Java baseline for Epic #13. Phase 2: blocking-handler JDK `HttpServer`
+behind Nginx with a 5-path stub router, keep-alive sized for the Nginx
+64-idle envelope, and request-logging hooks. No database code, no JWT code
+(those land in #16-#18).
 
 ## Stack
 
@@ -14,7 +15,7 @@ database code, no JWT code (those land in #15-#18).
 | SQLite driver | `org.xerial:sqlite-jdbc:3.53.4.0` (declared, not yet wired; wiring lands later) |
 | Pool | `com.zaxxer:HikariCP:6.2.1` (declared, not yet wired; pool-4 is the starting posture per OPT-07) |
 | Fat-jar plugin | `org.apache.maven.plugins:maven-shade-plugin:3.6.0` (build-time only) |
-| JSON library | none in Phase 1 (decision owned by #17; no Jackson here) |
+| JSON library | none in Phase 2 (decision owned by #17; no Jackson here) |
 
 ## Pins + checksums
 
@@ -38,23 +39,54 @@ Re-print pins with one command (from the repo root):
 |---|---|---|
 | `install.sh` | root, once, clean Ubuntu 24.04 | installs the pinned JDK + Maven above, verifying archive checksums; idempotent via `.installed` markers |
 | `build.sh` | normal user | `mvn clean package` with the pinned toolchain; downloads only pinned Maven Central deps; produces `target/server.jar`; no prebuilt binaries |
-| `start.sh` | normal user, foreground | `exec java -Xmx512m -jar target/server.jar`; honors `SQLITE_PATH` / `JWT_SECRET` (required, not yet consumed) / `HOST` (default `127.0.0.1`) / `PORT` (default `3000`); `JAVA_OPTS` is the append point for later JVM flags |
+| `start.sh` | normal user, foreground | `exec java -Xmx512m -Dsun.net.httpserver.idleInterval=70 -jar target/server.jar`; honors `SQLITE_PATH` / `JWT_SECRET` (required, not yet consumed) / `HOST` (default `127.0.0.1`) / `PORT` (default `3000`); `JAVA_OPTS` is the append point for later JVM flags; echoes all `sun.net.httpserver.*` flags to the startup log |
 
-`start.sh` binds `HOST:PORT` via `challenge.Main` and answers every path with
-byte-exact `{"error":"not found"}` (`Content-Type: application/json`, status
-404). `SIGTERM` stops the server via a shutdown hook and exits `0`.
-JVM-flag changes (idle/keep-alive posture) are placeholders for later tickets,
-not this one.
+`start.sh` binds `HOST:PORT` via `challenge.Main` with a 5-path stub router
+(`GET /health`, `GET /feed`, `GET /posts/:id`, `POST /posts`,
+`POST /posts/:id/like`) plus a byte-exact `{"error":"not found"}`
+(`Content-Type: application/json`, status 404) fallback. Stub bodies are
+SPEC-shaped strings only; real logic lands in #16-#18. `SIGTERM` stops the
+server via a shutdown hook and exits `0`.
+
+## JDK HttpServer keep-alive posture (Phase 2, planning doc section K)
+
+| Setting | Default | Standing in this ticket | Why |
+|---|---|---|---|
+| `sun.net.httpserver.idleInterval` | 30 s | `70` (changed in `start.sh`) | SPEC requires idle ≥ 65 s behind Nginx (`keepalive 64`); JDK default closes too early; same value class as the reference 70 s pin |
+| `sun.net.httpserver.maxIdleConnections` | 200 | 200 (recorded, unchanged) | Covers the 64-idle envelope with headroom; direct-mode ~15k sizing deferred to Phase 10/DX-3 |
+| `sun.net.httpserver.nodelay` | false | false (recorded, unchanged) | Experimental latency knob; enabling it is unmeasured optimization, deferred to Phase 10 |
+
+Only the first row changed; the other two are recorded in `start.sh` echo +
+`Main` startup log and left at their defaults. No thread/pool/GC tuning here
+(fixed pool 4 + backlog 128 are the starting posture; tuning belongs to
+Phases 9-11).
+
+## Router + logging hooks
+
+Router is stdlib-only with minimal-diff senior-dev mode (no framework, no
+abstractions): exact matches for `/health`, `/feed`, `/posts`, prefix shapes
+for `/posts/:id` and `/posts/:id/like`, method-gated, 404 fallback otherwise.
+No id validation, no auth, no JSON library (stub strings only).
+
+Request-logging hooks for later benchmark columns (§3.4): total-request
+counter, per-status counters, and a one-line `METHOD path -> status` log.
+Accept-queue depth and refused connections are observed at the OS/executor
+level; this ticket adds the response-code hook only, with no profiling agent.
 
 ## Serve mode
 
-Nginx-first (`127.0.0.1:3000` behind `bench/nginx.conf`). Direct `0.0.0.0:80`
-is not served in Phase 1; mode comparison belongs to a later phase.
+Nginx-first (`127.0.0.1:3000` behind `bench/nginx.conf`, `keepalive 64`).
+Direct `0.0.0.0:80` is not served in Phase 2; mode comparison belongs to a
+later phase (DX-3 owns it in Phase 10).
+
+Backlog stays 128 behind Nginx (starting posture). The box grants
+`LimitNOFILE=65535`; sizing for ~15k direct-mode idles is deferred to
+Phase 10/DX-3 (notes only here).
 
 ## Optimizations
 
-Empty until measured. No tuning in Phase 1 (minimal-diff senior-dev mode:
-smallest set that serves later phases).
+Empty until measured. No tuning in Phase 2 (minimal-diff senior-dev mode:
+smallest change that serves later phases).
 
 ## License notices
 
