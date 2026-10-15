@@ -44,7 +44,7 @@ Re-print pins with one command (from the repo root):
 |---|---|---|
 | `install.sh` | root, once, clean Ubuntu 24.04 | installs the pinned JDK + Maven above, verifying archive checksums; idempotent via `.installed` markers |
 | `build.sh` | normal user | `mvn clean package` with the pinned toolchain; downloads only pinned Maven Central deps; produces `target/server.jar`; no prebuilt binaries |
-| `start.sh` | normal user, foreground | `exec java -Xmx512m -Dsun.net.httpserver.idleInterval=70 -jar target/server.jar`; honors `SQLITE_PATH` (required, fresh DB copy) / `JWT_SECRET` (required, consumed by `challenge.Auth` on every authed request) / `HOST` (default `127.0.0.1`) / `PORT` (default `3000`); `JAVA_OPTS` is the append point for later JVM flags; echoes all `sun.net.httpserver.*` flags to the startup log |
+| `start.sh` | normal user, foreground | `exec java -Xmx512m -Dsun.net.httpserver.idleInterval=70 -jar target/server.jar`; honors `SQLITE_PATH` (required, fresh DB copy) / `JWT_SECRET` (required, consumed by `challenge.Auth` on every authed request) / `HOST` (default `127.0.0.1`) / `PORT` (default `3000`); `JAVA_OPTS` is the append point for later JVM flags; echoes `-Xmx` + all `sun.net.httpserver.*` flags to the startup log |
 
 `start.sh` binds `HOST:PORT` via `challenge.Main` with a 5-path router
 (`GET /health` live since Phase 3, `GET /feed` and `GET /posts/:id` live since
@@ -165,6 +165,91 @@ later phase (DX-3 owns it in Phase 10).
 Backlog stays 128 behind Nginx (starting posture). The box grants
 `LimitNOFILE=65535`; sizing for ~15k direct-mode idles is deferred to
 Phase 10/DX-3 (notes only here).
+
+## Benchmark readiness (Gate E, #20)
+
+Nginx-first deploy. Everything the first benchmark assumes, verified before
+it runs. No load numbers are produced here (first measurements belong to
+#21); flags below are standing posture, explicitly not optima.
+
+### `start.sh` final
+
+- `-Dsun.net.httpserver.idleInterval=70` retained and echoed (SPEC needs idle
+  ≥ 65 s behind Nginx `keepalive 64`; JDK default 30 s is insufficient).
+- JVM posture `-Xmx512m`, default collector (no `-XX` flag; collector x heap
+  tuning belongs to DX-7, Phase 11).
+- Foreground `exec` (replaces the shell; `SIGTERM` stops the server via the
+  shutdown hook and exits `0`).
+- Env-only configuration: `SQLITE_PATH` (required, fresh DB copy) /
+  `JWT_SECRET` (required) / `HOST` (default `127.0.0.1`) / `PORT` (default
+  `3000`). `JAVA_OPTS` is the append point for later JVM flags.
+- Healthy start well inside the ≤ 60 s rule (`test/run.sh` waits up to 60 s
+  for `/health`; dev starts answer in seconds).
+- Startup log proves the posture: `-Xmx` + `sun.net.httpserver.*` lines from
+  `start.sh` plus live-property lines from `challenge.Main`.
+
+### Nginx smoke + 65 s idle
+
+- App behind a `bench/nginx.conf`-equivalent (`upstream keepalive 64`)
+  serves the suite's health + feed correctly (smoke: `GET /health` 200,
+  `GET /feed` 200 through the proxy).
+- 65 s idle rule holds through Nginx: one client connection kept idle 66 s
+  through the proxy answers 200 before and after (`IDLE-65s-HOLD: PASS`).
+  App side is guaranteed by `idleInterval=70` (> 65); the 200-default
+  `maxIdleConnections` covers the 64-idle envelope with headroom.
+- Direct `0.0.0.0:80` serving stays out of scope here (mode comparison
+  belongs to DX-3, Phase 10).
+
+### Seed state
+
+- `seed/feed.db` content sha matches the `seed/make-seed.sh` `EXPECTED`
+  value (50k users / 500k posts / 2M likes + `seed/tokens.json`).
+- Fresh-copy-per-run discipline: never serve `seed/feed.db` directly — every
+  gate or bench run starts from a private copy
+  (`cp seed/feed.db /tmp/bench.db`, `SQLITE_PATH=/tmp/bench.db`). The suite
+  fails goldens on a reused DB by design (freshness proof in `docs/GATE.md`).
+
+### Resource / limit notes (2 GB box, no swap)
+
+- `LimitNOFILE=65535` is granted by the box service file; backlog stays 128
+  behind Nginx (starting posture; direct-mode ~15k-idle sizing belongs to
+  DX-3, Phase 10).
+- Heap-vs-RSS: `-Xmx512m` caps the Java heap, not the process. RSS also
+  carries SQLite page cache / `mmap`, pool + handler threads, direct
+  buffers, and the Nginx worker resident beside the app — all inside the
+  same 2 GB with no swap, so OOM is loss. Heap and RSS are recorded as
+  separate columns (below), never conflated.
+- JFR plan for #21: continuous low-overhead recording stays on per run with
+  a disk cap + rotation (2 GB box), plus one JFR-off falsifier per lane to
+  prove p99 is not a profiling artifact.
+
+### Monitoring columns (Roadmap §3.4 template — no numbers here)
+
+| VUs | k6 avg/med/p95/p99/max | err% | k6 exit | srv CPU% | srv RSS/free | gen CPU/RAM | mode (nginx/direct) | gate (suite line) | verdict |
+|---|---|---|---|---|---|---|---|---|---|
+| ... | ... | ... | ... | ... | ... | ... | nginx | `passed=42 failed=0` | ... |
+
+Every #21 row carries the gate line, the full k6 command, pass AND fail+1
+rows, pragma declaration, JFR on/off + artifact path, and drain-wait record.
+
+### #21 preconditions (not run here)
+
+- k6 runs on a SEPARATE machine (never co-located with the 1-vCPU server).
+- Drain-wait discipline between runs: wait for ephemeral ports to drain
+  (or use a fresh generator), and record generator count, ephemeral range,
+  drain wait, and retry policy in every run log.
+
+### Rehearsal record
+
+- `install.sh` unchanged (no gaps found): pinned JDK 25 + Maven 3.9.11 with
+  archive checksum verification, idempotent via `.installed` markers.
+- `build.sh` unchanged (no gaps found): pinned-toolchain `mvn clean verify`,
+  `target/server.jar`, no prebuilt binaries.
+- Re-gate after script changes: JUnit green + suite line pasted on #20
+  (authoritative `passed=42 failed=0` on Ubuntu/CI; Windows dev shows the
+  known single special-char `curl` quirk, unchanged from #19).
+
+Method: minimal-diff senior-dev mode (smallest change serving later phases).
 
 ## Optimizations
 

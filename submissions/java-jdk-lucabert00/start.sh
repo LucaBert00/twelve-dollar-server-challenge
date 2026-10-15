@@ -25,9 +25,10 @@ JAVA_OPTS_ARR+=(-Dsun.net.httpserver.idleInterval=70)
 echo "JDK HttpServer flags (startup log):"
 for flag in "${JAVA_OPTS_ARR[@]}"; do
   case "$flag" in
-    -Dsun.net.httpserver.*) echo "  $flag" ;;
+    -Xmx*|-Dsun.net.httpserver.*) echo "  $flag" ;;
   esac
 done
+echo "  collector=default (no -XX flag; DX-7 owns tuning)"
 echo "  sun.net.httpserver.maxIdleConnections=200 (default, unchanged)"
 echo "  sun.net.httpserver.nodelay=false (default, unchanged)"
 
