@@ -454,6 +454,7 @@ final class Db {
     execOrThrow(db, "PRAGMA foreign_keys=ON", role);
     execOrThrow(db, "PRAGMA busy_timeout=" + busyTimeoutMs, role);
     execOrThrow(db, "PRAGMA wal_autocheckpoint=0", role);
+    execOrThrow(db, "PRAGMA journal_size_limit=67108864", role);
     execOrThrow(db, "PRAGMA mmap_size=1073741824", role);
     execOrThrow(db, "PRAGMA cache_size=-65536", role);
     execOrThrow(db, "PRAGMA temp_store=MEMORY", role);
@@ -465,6 +466,7 @@ final class Db {
     long foreignKeys = pragmaLong(db, "PRAGMA foreign_keys");
     long busyTimeout = pragmaLong(db, "PRAGMA busy_timeout");
     long autocheckpoint = pragmaLong(db, "PRAGMA wal_autocheckpoint");
+    long journalSizeLimit = pragmaLong(db, "PRAGMA journal_size_limit");
     long mmapSize = pragmaLong(db, "PRAGMA mmap_size");
     long cacheSize = pragmaLong(db, "PRAGMA cache_size");
     long tempStore = pragmaLong(db, "PRAGMA temp_store");
@@ -475,6 +477,7 @@ final class Db {
             && foreignKeys == 1
             && busyTimeout == busyTimeoutMs
             && autocheckpoint == 0
+            && journalSizeLimit == 67108864L
             && mmapSize == 1073741824L
             && cacheSize == -65536L
             && tempStore == 2L;
@@ -492,6 +495,8 @@ final class Db {
               + busyTimeout
               + " wal_autocheckpoint="
               + autocheckpoint
+              + " journal_size_limit="
+              + journalSizeLimit
               + " mmap_size="
               + mmapSize
               + " cache_size="
