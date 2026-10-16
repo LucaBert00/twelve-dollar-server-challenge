@@ -4,8 +4,12 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-JDK_HOME=${JAVA_HOME:-/opt/jdk}
-[ -x "$JDK_HOME/bin/javac" ] || JDK_HOME=/opt/jdk
+# Prefer the install.sh-pinned JDK: CI runners pre-set JAVA_HOME to a system
+# JDK older than 27, which rejects --release 27. Fall back to the env only
+# when install.sh has not run. On the droplet /opt/jdk exists, so behaviour
+# there is unchanged.
+JDK_HOME=/opt/jdk
+[ -x "$JDK_HOME/bin/javac" ] || JDK_HOME=${JAVA_HOME:-/opt/jdk}
 JAVAC="$JDK_HOME/bin/javac"
 
 # SQLite 3.54.0. Built here, not downloaded as a binary: rule 10 forbids shipping prebuilt
