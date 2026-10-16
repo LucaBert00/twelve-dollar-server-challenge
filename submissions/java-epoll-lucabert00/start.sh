@@ -14,8 +14,12 @@ export PORT=${PORT:-80}
 # N workers can hold N x 65,535. Two workers is the whole win - above ~100k VUs two processes
 # sharing one SQLite file stop being able to reset the WAL, and a third worker makes that worse.
 WORKERS=${WORKERS:-2}
-JAVA=${JAVA_HOME:-/opt/jdk}/bin/java
-[ -x "$JAVA" ] || JAVA=/opt/jdk/bin/java
+# Prefer the install.sh-pinned runtime: CI runners pre-set JAVA_HOME to a system
+# JDK whose flags predate this submission (e.g. no UseCompactObjectHeaders),
+# so its JVM refuses to start. Fall back to the env only when install.sh has
+# not run. On the droplet /opt/jdk exists, so behaviour there is unchanged.
+JAVA=/opt/jdk/bin/java
+[ -x "$JAVA" ] || JAVA=${JAVA_HOME:-/opt/jdk}/bin/java
 [ -x "$JAVA" ] || { echo "start.sh: no java at $JAVA (install.sh first)" >&2; exit 1; }
 [ -f "$PWD/build/native/libsqlite3.so" ] || { echo "start.sh: no $PWD/build/native/libsqlite3.so (build.sh first)" >&2; exit 1; }
 
