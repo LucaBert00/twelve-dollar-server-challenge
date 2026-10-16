@@ -15,6 +15,9 @@ export PORT=${PORT:-80}
 # sharing one SQLite file stop being able to reset the WAL, and a third worker makes that worse.
 WORKERS=${WORKERS:-2}
 JAVA=${JAVA_HOME:-/opt/jdk}/bin/java
+[ -x "$JAVA" ] || JAVA=/opt/jdk/bin/java
+[ -x "$JAVA" ] || { echo "start.sh: no java at $JAVA (install.sh first)" >&2; exit 1; }
+[ -f "$PWD/build/native/libsqlite3.so" ] || { echo "start.sh: no $PWD/build/native/libsqlite3.so (build.sh first)" >&2; exit 1; }
 
 # 1 vCPU. SerialGC because G1/Parallel spawn GC threads that only contend with request work.
 # -Xms == -Xmx: no heap resizing during the 60 s ramp. Live data is tiny (per-connection state is
