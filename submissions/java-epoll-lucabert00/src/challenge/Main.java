@@ -1,6 +1,8 @@
 package challenge;
 
+import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.net.InetAddress;
 import java.util.HashMap;
 import java.util.Map;
@@ -119,7 +121,12 @@ public final class Main {
     private final Map<Integer, Acc> pending = new HashMap<>();
 
     private final byte[] readTmp = new byte[READ_CHUNK];
-    private final MemorySegment readSeg = MemorySegment.ofArray(readTmp);
+    // A downcall rejects a heap segment: SharedUtils.checkNative throws "Heap segment not allowed"
+    // for anything that is not native, and there is no Linker.Option to opt out. So the kernel
+    // fills native memory and the bytes are copied into readTmp for append(). The copy is bounded
+    // by READ_CHUNK and costs nothing that matters: the falsifier in AGENTS.md section 2 puts
+    // per-request CPU nowhere near binding at any VU count this can serve.
+    private final MemorySegment readSeg = Arena.global().allocate(READ_CHUNK, 8);
 
     private final long startNanos;
     private Server server;
@@ -142,6 +149,7 @@ public final class Main {
         for (; ; ) {
           long r = Sys.read(fd, readSeg, READ_CHUNK);
           if (r > 0) {
+            MemorySegment.copy(readSeg, ValueLayout.JAVA_BYTE, 0L, readTmp, 0, (int) r);
             append(fd, readTmp, 0, (int) r);
             if (r < READ_CHUNK) {
               break;
@@ -271,7 +279,13 @@ public final class Main {
      * promptly — and the client retry path, not a hung worker, carries them.
      */
     private void writeFully(int fd, byte[] framed) {
-      MemorySegment msg = MemorySegment.ofArray(framed);
+      // Same reason as the read buffer: a downcall will not take a heap segment. Arena.ofAuto frees
+      // the block once it becomes unreachable, so no response leaks and the early returns below
+      // need no try/finally. One allocation per response is free at this duty cycle (falsifier,
+      // AGENTS.md section 2); reusing a fixed buffer would need a size cap and a fallback path for
+      // the day a response outgrows it, which is a bug waiting to happen for no measurable gain.
+      MemorySegment msg = Arena.ofAuto().allocate(framed.length, 8);
+      MemorySegment.copy(framed, 0, msg, ValueLayout.JAVA_BYTE, 0L, framed.length);
       long off = 0;
       int spins = 0;
       while (off < framed.length) {
