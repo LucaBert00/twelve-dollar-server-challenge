@@ -57,6 +57,11 @@ Top-down, in the order that matters:
    `-Xms == -Xmx` (no resizing during the ramp), CompactObjectHeaders,
    AlwaysPreTouch, no perf data, capped direct memory, and
    `--enable-native-access=ALL-UNNAMED` for the FFM calls.
+   The heap figure (`-Xms256m -Xmx256m -Xmn64m` per worker) is a documented
+   **placeholder, not a measured optimum** — two workers plus SQLite cache plus
+   mmap has to stay well inside 2 GB, and the value has never been tuned. Idle
+   capacity is bounded by descriptors, so the heap buys a young generation, not
+   retention. Tuning it belongs to bench phase, not to correctness.
 7. **Persistent prepared statements.** Prepared once per handle with
    `PREPARE_PERSISTENT`, reset plus rebind per use. Plan cache, never data.
 8. **LRU fd eviction with `SO_LINGER=0`.** On budget pressure and on
