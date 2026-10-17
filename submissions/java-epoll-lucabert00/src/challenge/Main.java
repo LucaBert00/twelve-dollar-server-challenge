@@ -115,6 +115,20 @@ public final class Main {
     /** Bounded spins on a full send buffer before dropping to protect the loop. */
     private static final int WRITE_SPINS = 1_000;
 
+    // TEMPORARY DIAGNOSTIC (refs #32) - remove in T3.
+    // #34 proved request bytes are never consumed: ss shows Recv-Q frozen at 84 on every socket.
+    // That is only possible if read() is not returning the queued bytes, so log what it returns and
+    // for which descriptor. Capped globally because the loop spins and would otherwise flood the log;
+    // 200 calls are reached in microseconds and cover all nine frozen descriptors many times over.
+    // Plain int, not atomic: only the single loop thread calls this.
+    private static int diagCount;
+
+    private static void diagRead(int fd, long r) {
+      if (diagCount++ < 200) {
+        System.err.println("[diag] read fd=" + fd + " r=" + r + " errno=" + Sys.errno());
+      }
+    }
+
     /** Accumulated unread bytes per fd. Only connections with a partial request hold one. */
     private final Map<Integer, Acc> pending = new HashMap<>();
 
@@ -141,6 +155,7 @@ public final class Main {
       try {
         for (; ; ) {
           long r = Sys.read(fd, readSeg, READ_CHUNK);
+          diagRead(fd, r);
           if (r > 0) {
             append(fd, readTmp, 0, (int) r);
             if (r < READ_CHUNK) {
