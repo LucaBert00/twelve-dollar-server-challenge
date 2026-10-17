@@ -91,17 +91,7 @@ final class Sys {
 
   private Sys() {}
 
-  // TEMPORARY DIAGNOSTIC (refs #32) - remove in T3.
-  // SharedUtils.checkNative allocates an IllegalArgumentException on every downcall, so no libc
-  // call has ever succeeded. A stack trace cannot say which access check rejected the call, but
-  // the message can. Capped because it fires per call; plain int because this is a one-shot
-  // diagnostic and exact counting across two threads does not matter.
-  private static int diagCount;
-
   private static RuntimeException rethrow(Throwable t) {
-    if (diagCount++ < 20) {
-      System.err.println("[diag] downcall failed: " + t);
-    }
     if (t instanceof RuntimeException r) {
       return r;
     }
