@@ -65,11 +65,16 @@ if command -v curl >/dev/null 2>&1; then
       curl -sf -m 5 "http://$HOST:$PORT/health" >/dev/null 2>&1 && exit 0
     done
     echo "start.sh: /health unanswered for 80 s (rule 10 budget); worker threads:" >&2
-    # Three samples ~2 s apart per worker, not one: a tight spin sits in the same frame
-    # every time, so agreement across samples is what distinguishes a spin from a block.
-    for p in "${pids[@]}"; do
-      for s in 1 2 3; do
-        sleep 2
+    # Three samples ~2 s apart, each one socket-state snapshot then both workers' stacks: a
+    # tight spin sits in the same frame every time, and Recv-Q across samples says whether the
+    # request bytes are being consumed at all. A thread dump alone cannot tell those apart.
+    for s in 1 2 3; do
+      sleep 2
+      echo "=== sample $s: tcp state on port $PORT ===" >&2
+      if command -v ss >/dev/null 2>&1; then
+        ss -tinp "sport = :$PORT" 2>&1 | head -40 >&2 || true
+      fi
+      for p in "${pids[@]}"; do
         echo "--- pid $p sample $s ---" >&2
         "$JCMD" "$p" Thread.print 2>&1 | head -200 >&2 || true
       done
