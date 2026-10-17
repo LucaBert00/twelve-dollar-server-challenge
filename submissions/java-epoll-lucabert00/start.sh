@@ -45,6 +45,32 @@ for i in $(seq 0 $((WORKERS - 1))); do
   pids+=($!)
 done
 
+# TEMPORARY E07 DIAGNOSTIC - remove once the loop is proven under the gate.
+#
+# test/run.sh polls /health with `curl -sf` and no --max-time, so a worker that never
+# answers leaves curl blocked and the job burns its entire 6 h ceiling with an empty
+# log. This bounds the *startup* window only: the first successful /health disarms
+# the watcher for good, so it can never fire during a benchmark hold. 8 x 10 s is
+# 80 s, past the rule 10 budget of 60 s, so any server that reaches it is already
+# broken by rule 10 and killing the set is correct rather than merely convenient.
+# When it does fire it prints both workers' thread stacks, which run.sh then shows
+# via `cat server.log` on its own 60 s deadline, and killing the workers is what
+# unblocks the harness curl in the first place.
+if command -v curl >/dev/null 2>&1; then
+  JCMD="$(dirname "$JAVA")/jcmd"
+  (
+    for _ in $(seq 1 8); do
+      sleep 10
+      curl -sf -m 5 "http://$HOST:$PORT/health" >/dev/null 2>&1 && exit 0
+    done
+    echo "start.sh: /health unanswered for 80 s (rule 10 budget); worker threads:" >&2
+    for p in "${pids[@]}"; do
+      "$JCMD" "$p" Thread.print 2>&1 | head -80 >&2 || true
+    done
+    kill "${pids[@]}" 2>/dev/null || true
+  ) &
+fi
+
 # A dead worker means half the connections are unroutable, so stop the whole set rather than
 # limp on at half service.
 trap 'kill "${pids[@]}" 2>/dev/null || true' TERM INT
