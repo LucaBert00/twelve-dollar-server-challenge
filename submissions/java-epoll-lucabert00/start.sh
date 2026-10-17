@@ -53,8 +53,9 @@ done
 # the watcher for good, so it can never fire during a benchmark hold. 8 x 10 s is
 # 80 s, past the rule 10 budget of 60 s, so any server that reaches it is already
 # broken by rule 10 and killing the set is correct rather than merely convenient.
-# When it does fire it prints both workers' thread stacks, which run.sh then shows
-# via `cat server.log` on its own 60 s deadline, and killing the workers is what
+# The sampling below runs after that trigger and only adds to an already-failed run.
+# When it does fire it prints each worker's thread stacks three times over, which run.sh then
+# shows via `cat server.log` on its own 60 s deadline, and killing the workers is what
 # unblocks the harness curl in the first place.
 if command -v curl >/dev/null 2>&1; then
   JCMD="$(dirname "$JAVA")/jcmd"
@@ -64,8 +65,14 @@ if command -v curl >/dev/null 2>&1; then
       curl -sf -m 5 "http://$HOST:$PORT/health" >/dev/null 2>&1 && exit 0
     done
     echo "start.sh: /health unanswered for 80 s (rule 10 budget); worker threads:" >&2
+    # Three samples ~2 s apart per worker, not one: a tight spin sits in the same frame
+    # every time, so agreement across samples is what distinguishes a spin from a block.
     for p in "${pids[@]}"; do
-      "$JCMD" "$p" Thread.print 2>&1 | head -80 >&2 || true
+      for s in 1 2 3; do
+        sleep 2
+        echo "--- pid $p sample $s ---" >&2
+        "$JCMD" "$p" Thread.print 2>&1 | head -200 >&2 || true
+      done
     done
     kill "${pids[@]}" 2>/dev/null || true
   ) &
