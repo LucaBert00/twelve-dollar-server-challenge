@@ -71,6 +71,9 @@ public final class Main {
     final IoHandler io = new IoHandler(startNanos);
     final Server server = new Server(host, port, io);
     io.attach(server);
+    // The environment probe reads the descriptor ceiling from here: the numbers come from the
+    // process that will serve, not from a shell whose limits may differ.
+    System.out.println("startup: " + server.startupLine());
     final Checkpointer checkpointer = new Checkpointer(server, sqlitePath);
     checkpointer.start();
 

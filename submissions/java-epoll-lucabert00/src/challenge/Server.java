@@ -1,11 +1,15 @@
 package challenge;
 
 import com.sun.management.UnixOperatingSystemMXBean;
+import java.io.BufferedReader;
+import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.management.ManagementFactory;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.Objects;
 
 /**
@@ -186,6 +190,49 @@ final class Server {
       // Fall through to the fallback below.
     }
     return 1 << 16;
+  }
+
+  /**
+   * Reports the descriptor ceiling and the eviction watermarks in one line.
+   *
+   * <p>Printed at startup so the environment probe captures the numbers from the process that
+   * will actually serve, rather than from a shell whose limits may differ.
+   *
+   * @return the line, never null
+   */
+  String startupLine() {
+    return "fd-ceiling="
+        + fdLimit()
+        + " high="
+        + high
+        + " low="
+        + low
+        + " nofile=["
+        + procNoFile()
+        + "]";
+  }
+
+  /**
+   * Reads this process's own "Max open files" line from {@code /proc/self/limits}.
+   *
+   * <p>The JVM raises the soft {@code RLIMIT_NOFILE} to the hard limit at startup, so the soft
+   * limit a shell reported is not the ceiling this process runs under. The kernel's own view,
+   * read from inside the process, shows the limits actually in force.
+   *
+   * @return the line's contents, or a short reason when it cannot be read
+   */
+  static String procNoFile() {
+    try (BufferedReader reader = Files.newBufferedReader(Path.of("/proc/self/limits"))) {
+      String line;
+      while ((line = reader.readLine()) != null) {
+        if (line.startsWith("Max open files")) {
+          return line.trim();
+        }
+      }
+      return "Max open files not found";
+    } catch (IOException | RuntimeException e) {
+      return "unreadable: " + e;
+    }
   }
 
   /**
