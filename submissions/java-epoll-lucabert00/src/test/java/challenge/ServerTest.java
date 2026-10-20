@@ -41,6 +41,24 @@ class ServerTest {
   }
 
   @Test
+  @DisplayName("the effective high watermark is the lower budget, with a floor")
+  void effectiveHighMarkIsTheLowerBudget() {
+    // The descriptor budget always caps it.
+    assertEquals(2000, Server.effectiveHighMark(2000, 100000), "the fd budget caps the watermark");
+    // The memory budget can lower it.
+    assertEquals(5000, Server.effectiveHighMark(10000, 5000), "the memory budget lowers it");
+    // ... but never below the floor: a server that accepts nothing scores nothing.
+    assertEquals(
+        Server.MIN_HIGH_WATER,
+        Server.effectiveHighMark(10000, 0),
+        "the watermark must not fall to zero");
+    assertEquals(
+        Server.MIN_HIGH_WATER,
+        Server.effectiveHighMark(10000, Integer.MAX_VALUE),
+        "an unknown box keeps the fd budget");
+  }
+
+  @Test
   @DisplayName("the wait timeout is the earliest deadline")
   void waitTimeoutIsTheEarliestDeadline() {
     long now = 1_000_000_000L;

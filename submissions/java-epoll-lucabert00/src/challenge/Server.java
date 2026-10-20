@@ -73,6 +73,16 @@ final class Server {
    */
   static final long JVM_OVERHEAD_BYTES = 96L * 1024 * 1024;
 
+  /**
+   * Floor for the connection high-water.
+   *
+   * <p>A server that accepts nothing scores nothing, so the memory budget never takes the
+   * high-water below this. 1024 idle sockets cost about 5 MiB of kernel memory, which is
+   * small next to the reserve the budget already holds back. The descriptor budget still
+   * caps it.
+   */
+  static final int MIN_HIGH_WATER = 1024;
+
   /** Worker-shared I/O scratch size in bytes; E03 parses out of this, not per-conn buffers. */
   static final int SHARED_BUF_BYTES = 1 << 16;
 
@@ -197,7 +207,7 @@ final class Server {
     this.memoryHigh = memoryHighMark(boxBytes, workers);
     // The score is connection capacity, and the two ceilings are coupled: the descriptor
     // budget and the RAM budget. The lower one binds, so take the lower one.
-    this.high = (int) Math.min(fdHigh, memoryHigh);
+    this.high = effectiveHighMark(fdHigh, memoryHigh);
     this.low = lowMark(high);
     this.boxBytes = boxBytes;
     int size = (int) Math.min(limit, 1 << 20);
@@ -205,6 +215,20 @@ final class Server {
       size = 16;
     }
     this.table = new Conn[size];
+  }
+
+  /**
+   * Combines the two budgets into the effective high watermark.
+   *
+   * <p>The descriptor budget always caps it. The memory budget can only lower it, down to
+   * the floor: a server that accepts nothing scores nothing.
+   *
+   * @param fdHigh the high watermark the descriptor budget allows
+   * @param memoryHigh the high watermark the memory budget allows
+   * @return the effective high watermark
+   */
+  static int effectiveHighMark(int fdHigh, int memoryHigh) {
+    return Math.min(fdHigh, Math.max(MIN_HIGH_WATER, memoryHigh));
   }
 
   /**
