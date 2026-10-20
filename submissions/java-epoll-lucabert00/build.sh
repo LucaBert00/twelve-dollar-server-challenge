@@ -64,7 +64,7 @@ fi
 
 # --release 27 so the source cannot drift onto an API newer than the pinned JDK.
 "${JAVAC}" --release 27 -Xlint:-options -d build/classes src/challenge/*.java
-"${JAVAC}" --release 27 -Xlint:-options -cp "build/${JUNIT_JAR}" \
+"${JAVAC}" --release 27 -Xlint:-options -cp "build/classes:build/${JUNIT_JAR}" \
     -d build/test-classes src/test/java/challenge/*.java
 
 # The suite runs from the build, the same way the sibling submission's build runs its tests:

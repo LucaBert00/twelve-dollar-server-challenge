@@ -450,7 +450,7 @@ class HttpGateTest {
    * @param pid the worker process id
    * @return the count, or -1 when the process's descriptor directory is not readable
    */
-  private static int countOpenDescriptors(int pid) throws IOException {
+  private static int countOpenDescriptors(long pid) throws IOException {
     Path fdDir = Path.of("/proc", String.valueOf(pid), "fd");
     if (!Files.isDirectory(fdDir)) {
       return -1;
