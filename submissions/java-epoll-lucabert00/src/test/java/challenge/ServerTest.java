@@ -53,7 +53,7 @@ class ServerTest {
         Server.effectiveHighMark(10000, 0),
         "the watermark must not fall to zero");
     assertEquals(
-        Server.MIN_HIGH_WATER,
+        10000,
         Server.effectiveHighMark(10000, Integer.MAX_VALUE),
         "an unknown box keeps the fd budget");
   }
