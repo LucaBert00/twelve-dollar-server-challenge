@@ -29,9 +29,9 @@ import java.util.Optional;
  * {@code SQLITE_PREPARE_PERSISTENT}: a persistent statement is written into the schema, so
  * preparing one takes the write lock, which the reader handle must never do.
  *
- * <p>Writes use group commit. The caller opens with {@code BEGIN IMMEDIATE}, runs one or more
- * inserts inside the same txn, then runs {@code COMMIT} and only afterwards answers. When
- * {@code COMMIT} fails the caller answers {@code 500} for every op in the batch.
+ * <p>A write opens with {@code BEGIN IMMEDIATE}, runs its inserts inside the same txn,
+ * then runs {@code COMMIT}, and the answer goes out only after that commit returns. When
+ * the commit fails the caller answers {@code 500} for the op it held.
  */
 final class Db {
   /**

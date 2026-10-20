@@ -1,9 +1,13 @@
 package challenge;
 
+import static java.lang.foreign.ValueLayout.ADDRESS;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
+import java.lang.foreign.Arena;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
@@ -385,6 +389,94 @@ class HttpGateTest {
     assertTrue(
         after <= before,
         "the peer half-close must release the descriptor: before=" + before + " after=" + after);
+  }
+
+  @Test
+  @Order(10)
+  @DisplayName("a busy write lock is waited for, not failed")
+  void busyWriteLockIsWaitedFor() throws Exception {
+    // Arrange: a second connection on the server's own database file, holding
+    // the write lock. The server is a separate process, so it sees the lock.
+    MemorySegment holder = openHolder(tempDir.resolve("feed.db"));
+    try {
+      assertTrue(beginImmediate(holder), "the holder must take the write lock");
+
+      // Act: a write while the lock is held, released half a second later.
+      long start = System.nanoTime();
+      Thread releaser =
+          new Thread(
+              () -> {
+                try {
+                  Thread.sleep(500);
+                } catch (InterruptedException e) {
+                  Thread.currentThread().interrupt();
+                }
+                execText(holder, "COMMIT");
+              });
+      releaser.start();
+      Reply reply = post("/posts", "Bearer " + TestTokens.valid(SECRET, 1, USER), "{\"body\":\"queued write\"}");
+      releaser.join();
+      long elapsedMs = (System.nanoTime() - start) / 1_000_000L;
+
+      // Assert: the write waited for the lock and then committed. A server that
+      // failed the write would have answered 500 straight away, in no time at all.
+      assertEquals(201, reply.status(), reply.body());
+      assertTrue(elapsedMs >= 400, "the write must wait for the lock, took " + elapsedMs + "ms");
+    } finally {
+      execText(holder, "COMMIT");
+    }
+  }
+
+  /**
+   * Opens a second connection on a database file, for holding the write lock.
+   *
+   * @param dbFile the database to open
+   * @return the connection handle
+   */
+  private static MemorySegment openHolder(Path dbFile) throws Exception {
+    byte[] path = dbFile.toString().getBytes(StandardCharsets.UTF_8);
+    try (Arena arena = Arena.ofConfined()) {
+      MemorySegment pathSeg = arena.allocate(path.length + 1L, 1);
+      MemorySegment.copy(path, 0, pathSeg, ValueLayout.JAVA_BYTE, 0L, path.length);
+      pathSeg.set(ValueLayout.JAVA_BYTE, path.length, (byte) 0);
+      MemorySegment ppDb = Arena.global().allocate(ADDRESS);
+      int rc = Sqlite.openV2(pathSeg, ppDb, Sqlite.OPEN_READWRITE | Sqlite.OPEN_NOMUTEX);
+      assertEquals(Sqlite.OK, rc, "the holder connection must open");
+      return ppDb.get(ADDRESS, 0);
+    }
+  }
+
+  /**
+   * Takes the write lock, retrying while the server holds it.
+   *
+   * @param db the holder connection
+   * @return true when the lock was taken
+   */
+  private static boolean beginImmediate(MemorySegment db) throws Exception {
+    for (int i = 0; i < 50; i++) {
+      if (execText(db, "BEGIN IMMEDIATE") == Sqlite.OK) {
+        return true;
+      }
+      Thread.sleep(10);
+    }
+    return false;
+  }
+
+  /**
+   * Runs one statement on a connection.
+   *
+   * @param db the connection
+   * @param sql the statement text
+   * @return the SQLite result code
+   */
+  private static int execText(MemorySegment db, String sql) {
+    byte[] utf8 = sql.getBytes(StandardCharsets.UTF_8);
+    try (Arena arena = Arena.ofConfined()) {
+      MemorySegment seg = arena.allocate(utf8.length + 1L, 1);
+      MemorySegment.copy(utf8, 0, seg, ValueLayout.JAVA_BYTE, 0L, utf8.length);
+      seg.set(ValueLayout.JAVA_BYTE, utf8.length, (byte) 0);
+      return Sqlite.exec(db, seg);
+    }
   }
 
   private static Reply get(String path) throws Exception {

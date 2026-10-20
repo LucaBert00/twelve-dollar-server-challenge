@@ -52,7 +52,7 @@ final class Server {
   static final int F_IN_FLIGHT = 1;
 
   /**
-   * Dispatch seam for readable and writable connections.
+   * Dispatch seam for readable connections and for the end of an event-loop pass.
    *
    * <p>E03/E04 implement this; the loop only owns sockets and never parses or responds itself.
    */
@@ -65,11 +65,12 @@ final class Server {
     void onReadable(int fd);
 
     /**
-     * Handles a writable connection.
+     * Runs after every event-loop pass.
      *
-     * @param fd the ready connection descriptor, never negative
+     * <p>The write flush lives here: queued write ops are batched into one transaction at
+     * the end of the pass, so every answer in the batch follows the commit that covers it.
      */
-    void onWritable(int fd);
+    void onIdle();
   }
 
   /**
@@ -137,6 +138,7 @@ final class Server {
   private int listenFd = -1;
   private volatile boolean running;
   private volatile long pauseDeadlineNanos;
+  private volatile long writeRetryDeadlineNanos;
   private MemorySegment events;
   private MemorySegment sharedBuf;
 
@@ -286,6 +288,9 @@ final class Server {
         for (int i = 0; i < n && running; i++) {
           dispatch(Sys.eventFd(events, i), Sys.eventFlags(events, i));
         }
+        if (handler != null) {
+          handler.onIdle();
+        }
       }
     } finally {
       shutdown();
@@ -316,30 +321,72 @@ final class Server {
   }
 
   /**
-   * Derives the epoll wait timeout from the pause deadline so held writes wake on time.
+   * Arms the write-retry deadline; 0 clears it.
    *
-   * @return milliseconds to wait: time to the deadline clamped to the default when none
+   * <p>Set when the write lock is busy, so the loop wakes in time to retry the queued
+   * writes instead of sleeping out the default wait.
+   *
+   * @param deadlineNanos the {@link System#nanoTime} instant the retry is due by
    */
-  int epollTimeoutMillis() {
-    return epollTimeoutMillis(pauseDeadlineNanos, System.nanoTime());
+  void setWriteRetryDeadlineNanos(long deadlineNanos) {
+    writeRetryDeadlineNanos = deadlineNanos;
   }
 
   /**
-   * Pure timeout computation for the pause deadline contract.
-   *
-   * @param deadlineNanos armed deadline in {@link System#nanoTime} units, 0 for none
-   * @param nowNanos current {@link System#nanoTime} reading
-   * @return wait milliseconds, 0 when the deadline already passed
+   * Clears any write-retry deadline previously armed.
    */
-  static int epollTimeoutMillis(long deadlineNanos, long nowNanos) {
+  void clearWriteRetryDeadline() {
+    writeRetryDeadlineNanos = 0;
+  }
+
+  /**
+   * Derives the epoll wait timeout from the pause deadline so held writes wake on time.
+   *
+   * @return milliseconds to wait: the earliest of the pause deadline, the write-retry
+   *     deadline and the default
+   */
+  int epollTimeoutMillis() {
+    return epollTimeoutMillis(pauseDeadlineNanos, writeRetryDeadlineNanos, System.nanoTime());
+  }
+
+  /**
+   * Pure timeout computation for the deadline contract.
+   *
+   * <p>The wait is the earliest of the checkpointer pause deadline, the write-retry
+   * deadline and the default. A held write and a busy write lock both have to wake the
+   * loop on time.
+   *
+   * @param pauseNanos the pause deadline, 0 for none
+   * @param retryNanos the write-retry deadline, 0 for none
+   * @param nowNanos current {@link System#nanoTime} reading
+   * @return wait milliseconds, 0 when a deadline already passed
+   */
+  static int epollTimeoutMillis(long pauseNanos, long retryNanos, long nowNanos) {
+    long wait = DEFAULT_WAIT_MILLIS;
+    long pause = millisUntil(pauseNanos, nowNanos);
+    if (pause < wait) {
+      wait = pause;
+    }
+    long retry = millisUntil(retryNanos, nowNanos);
+    if (retry < wait) {
+      wait = retry;
+    }
+    return (int) wait;
+  }
+
+  /**
+   * Milliseconds from now until a deadline, or {@link Long#MAX_VALUE} when there is none.
+   *
+   * @param deadlineNanos the deadline in {@link System#nanoTime} units, 0 for none
+   * @param nowNanos current {@link System#nanoTime} reading
+   * @return the wait in milliseconds, 0 when the deadline already passed
+   */
+  private static long millisUntil(long deadlineNanos, long nowNanos) {
     if (deadlineNanos <= 0) {
-      return DEFAULT_WAIT_MILLIS;
+      return Long.MAX_VALUE;
     }
     long dt = (deadlineNanos - nowNanos) / 1_000_000L;
-    if (dt < 0) {
-      return 0;
-    }
-    return (int) Math.min(dt, DEFAULT_WAIT_MILLIS);
+    return dt < 0 ? 0 : dt;
   }
 
   /**
@@ -416,11 +463,6 @@ final class Server {
       // released now rather than sitting in CLOSE_WAIT until the eviction watermark.
       closeConn(fd);
       return;
-    }
-    if ((flags & Sys.EPOLLOUT) != 0 && handler != null && get(fd) != null) {
-      get(fd).touch();
-      moveToTail(fd);
-      handler.onWritable(fd);
     }
   }
 

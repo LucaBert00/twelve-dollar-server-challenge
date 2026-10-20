@@ -4,8 +4,12 @@ import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.net.InetAddress;
+import java.util.ArrayDeque;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Worker entry point. One process runs one {@link Server} event loop plus one
@@ -105,15 +109,17 @@ public final class Main {
    * {@link Out}. Each response waits for its own {@code COMMIT} inside
    * {@link Http}, so a failed commit answers {@code 500} for its op.
    *
-   * <p>Kept deliberately small on purpose: per-request commit (no cross-loop
-   * batching) and blocking writes. The close side lives in {@link Server} —
-   * peer half-close, HUP/ERR reap, LRU eviction with RST — and this handler
-   * asks for the close when the peer has gone or the response could not be
-   * written. Idle connections therefore hold no heap here — the accumulation
-   * entry is dropped as soon as its bytes are consumed — and idle capacity
-   * stays bounded by descriptors, not memory.
+   * <p>Kept deliberately small on purpose: blocking writes and a write queue. A write op
+   * is prepared here and handed to {@link #flushWrites}, which batches the queued ops
+   * into one transaction and answers each of them only after the commit that covers it.
+   * A busy write lock never fails a request: the op waits for the lock. The close side
+   * lives in {@link Server} — peer half-close, HUP/ERR reap, LRU eviction with RST — and
+   * this handler asks for the close when the peer has gone or the response could not be
+   * written. Idle connections therefore hold no heap here — the accumulation entry is
+   * dropped as soon as its bytes are consumed — and idle capacity stays bounded by
+   * descriptors, not memory.
    */
-  static final class IoHandler implements Server.Handler {
+  static final class IoHandler implements Server.Handler, Http.WriteExec {
 
     /** Largest single read from the kernel per wakeup. */
     private static final int READ_CHUNK = 16 * 1024;
@@ -121,8 +127,22 @@ public final class Main {
     /** Bounded spins on a full send buffer before dropping to protect the loop. */
     private static final int WRITE_SPINS = 1_000;
 
+    /**
+     * Retry interval for a busy write lock.
+     *
+     * <p>AGENTS.md section 4.2: a busy lock is never blocked on. The queued writes are
+     * kept and retried on the next loop pass, at most a millisecond later.
+     */
+    private static final long WRITE_RETRY_NANOS = 1_000_000L;
+
     /** Accumulated unread bytes per fd. Only connections with a partial request hold one. */
     private final Map<Integer, Acc> pending = new HashMap<>();
+
+    /** Write ops waiting for the write lock, in arrival order. */
+    private final ArrayDeque<PendingWrite> writeQueue = new ArrayDeque<>();
+
+    /** Connections with an outstanding queued write op; their answers have to come first. */
+    private final Set<Integer> writeBlocked = new HashSet<>();
 
     private final byte[] readTmp = new byte[READ_CHUNK];
     // A downcall rejects a heap segment: SharedUtils.checkNative throws "Heap segment not allowed"
@@ -183,6 +203,13 @@ public final class Main {
           return;
         }
 
+        if (writeBlocked.contains(fd)) {
+          // A queued write op has to be answered before any later request on this
+          // connection. The bytes are buffered so the socket drains, but no answer
+          // goes out yet.
+          return;
+        }
+
         serveBuffered(fd);
       } catch (RuntimeException e) {
         // Never let a handler failure escape into the loop.
@@ -192,6 +219,91 @@ public final class Main {
           server.closeConn(fd);
         }
         server.setInFlight(fd, false);
+      }
+    }
+
+    @Override
+    public void onIdle() {
+      try {
+        flushWrites();
+      } catch (RuntimeException e) {
+        // The write path is broken. Fail everything queued rather than leaving the
+        // clients waiting for an answer that will never come.
+        while (!writeQueue.isEmpty()) {
+          answer(writeQueue.poll(), new Http.Reply(500, Json.error(Http.ERR_INTERNAL)));
+        }
+      }
+    }
+
+    @Override
+    public Http.Reply run(int fd, Http.WriteOp op, boolean keepAlive) {
+      writeQueue.add(new PendingWrite(fd, op, keepAlive, System.nanoTime()));
+      writeBlocked.add(fd);
+      return Http.DEFERRED;
+    }
+
+    /**
+     * Runs the queued write ops.
+     *
+     * <p>One {@code BEGIN IMMEDIATE} per op. On {@code SQLITE_BUSY} the queue is kept, the
+     * loop is asked to wake in a millisecond, and an op that has waited past the give-up
+     * bound is failed with {@code 500}. The answer for an op goes out only after the
+     * commit that covers it.
+     */
+    private void flushWrites() {
+      while (!writeQueue.isEmpty()) {
+        if (!Db.tryBeginImmediate()) {
+          // The write lock is held elsewhere. Keep the queue, wake in a millisecond, and
+          // fail only the ops that are past the give-up bound.
+          long now = System.nanoTime();
+          for (Iterator<PendingWrite> it = writeQueue.iterator(); it.hasNext(); ) {
+            PendingWrite queued = it.next();
+            if (Db.writeGiveUp(queued.queuedAtNanos)) {
+              it.remove();
+              answer(queued, new Http.Reply(500, Json.error(Http.ERR_INTERNAL)));
+            }
+          }
+          server.setWriteRetryDeadlineNanos(now + WRITE_RETRY_NANOS);
+          return;
+        }
+        PendingWrite queued = writeQueue.poll();
+        Http.Reply reply;
+        try {
+          reply = Http.executeWrite(queued.op);
+        } catch (RuntimeException e) {
+          Db.rollbackWrites();
+          answer(queued, new Http.Reply(500, Json.error(Http.ERR_INTERNAL)));
+          return;
+        }
+        if (!Db.commitWrites()) {
+          answer(queued, new Http.Reply(500, Json.error(Http.ERR_INTERNAL)));
+          return;
+        }
+        answer(queued, reply);
+      }
+      server.clearWriteRetryDeadline();
+    }
+
+    /**
+     * Sends the answer for a queued write op and releases the connection.
+     *
+     * <p>The answer goes out after the commit that covered the op. The connection is
+     * unblocked afterwards, and any bytes that arrived meanwhile are served.
+     *
+     * @param queued the op that was answered, never null
+     * @param reply the answer, never null
+     */
+    private void answer(PendingWrite queued, Http.Reply reply) {
+      int fd = queued.fd;
+      writeBlocked.remove(fd);
+      if (!writeFully(fd, Out.response(reply.status(), reply.body(), queued.keepAlive))) {
+        pending.remove(fd);
+        server.closeConn(fd);
+        return;
+      }
+      Acc acc = pending.get(fd);
+      if (acc != null && acc.len > 0) {
+        serveBuffered(fd);
       }
     }
 
@@ -239,7 +351,7 @@ public final class Main {
         long uptimeS = (System.nanoTime() - startNanos) / 1_000_000_000L;
         final Http.Reply reply;
         try {
-          reply = Http.handle(req, uptimeS, Jwt.CHECK);
+          reply = Http.handle(fd, req, uptimeS, Jwt.CHECK, this);
         } catch (RuntimeException e) {
           Http.Reply fallback = new Http.Reply(500, Json.error(Http.ERR_INTERNAL));
           if (!writeFully(fd, Out.response(fallback.status(), fallback.body(), req.keepAlive()))) {
@@ -252,6 +364,11 @@ public final class Main {
             return;
           }
           continue;
+        }
+        if (reply.status() == Http.DEFERRED_STATUS) {
+          // The write op is queued. Its answer follows the commit that covers it, so
+          // nothing else on this connection may be answered before it.
+          return;
         }
         if (!writeFully(fd, Out.response(reply.status(), reply.body(), req.keepAlive()))) {
           pending.remove(fd);
@@ -267,12 +384,6 @@ public final class Main {
           return;
         }
       }
-    }
-
-    @Override
-    public void onWritable(int fd) {
-      // No deferred writes: every response is flushed inside onReadable with a
-      // bounded spin, so there is nothing to resume here.
     }
 
     private void append(int fd, byte[] src, int off, int n) {
@@ -341,6 +452,29 @@ public final class Main {
         return false;
       }
       return true;
+    }
+  }
+
+  /** One queued write op: the connection it belongs to, the op, and when it was queued. */
+  static final class PendingWrite {
+    final int fd;
+    final Http.WriteOp op;
+    final boolean keepAlive;
+    final long queuedAtNanos;
+
+    /**
+     * Creates a queued write.
+     *
+     * @param fd the connection the op arrived on
+     * @param op the prepared op
+     * @param keepAlive the request's keep-alive decision
+     * @param queuedAtNanos the {@link System#nanoTime} instant the op was queued
+     */
+    PendingWrite(int fd, Http.WriteOp op, boolean keepAlive, long queuedAtNanos) {
+      this.fd = fd;
+      this.op = op;
+      this.keepAlive = keepAlive;
+      this.queuedAtNanos = queuedAtNanos;
     }
   }
 

@@ -117,6 +117,55 @@ final class Http {
    */
   static record Reply(int status, byte[] body) {}
 
+  /** Status value that marks a deferred write. Not a real HTTP status. */
+  static final int DEFERRED_STATUS = -1;
+
+  /**
+   * Marker answer for a write op that was queued instead of executed.
+   *
+   * <p>The answer for a queued op follows the commit that covers it, and that commit
+   * happens in the write flush rather than in the request handler. The status is not a
+   * real HTTP status, so a deferred answer can never be framed by accident.
+   */
+  static final Reply DEFERRED = new Reply(DEFERRED_STATUS, new byte[0]);
+
+  /** Which write an op performs. */
+  enum WriteKind {
+    /** POST /posts. */
+    CREATE_POST,
+    /** POST /posts/:id/like. */
+    LIKE
+  }
+
+  /**
+   * One write op that has passed auth and validation and is ready to run.
+   *
+   * @param kind which write the op performs
+   * @param userId the acting user id, from the token
+   * @param username the acting username, from the token, used as the post author
+   * @param body the trimmed body for a create, null for a like
+   * @param postId the liked post id, zero for a create
+   */
+  static record WriteOp(WriteKind kind, long userId, String username, String body, long postId) {}
+
+  /**
+   * Runs prepared write ops.
+   *
+   * <p>The loop owns this seam so a write can wait for the write lock instead of
+   * failing: the op is queued, and the answer follows the commit that covers it.
+   */
+  interface WriteExec {
+    /**
+     * Runs one prepared write op.
+     *
+     * @param fd the connection the op arrived on
+     * @param op the prepared op, never null
+     * @param keepAlive the request's keep-alive decision, echoed in the answer
+     * @return the answer, or {@link #DEFERRED} when the op was queued
+     */
+    Reply run(int fd, WriteOp op, boolean keepAlive);
+  }
+
   /**
    * Authenticated user from the token hook.
    *
@@ -162,13 +211,13 @@ final class Http {
   }
 
   /** Thrown for create-body validation; the message is the exact SPEC 400 text. */
-  static final class BodyFailure extends RuntimeException {
+  static final class ValidationFailure extends RuntimeException {
     /**
      * Creates a body failure with the exact SPEC error message.
      *
      * @param message the exact SPEC message, never null
      */
-    BodyFailure(String message) {
+    ValidationFailure(String message) {
       super(message);
     }
   }
@@ -394,19 +443,19 @@ final class Http {
    *
    * @param bodyJson the raw request body as UTF-8 text, never null
    * @return the trimmed body, never null
-   * @throws BodyFailure with the exact SPEC 400 text on any rejection
+   * @throws ValidationFailure with the exact SPEC 400 text on any rejection
    */
   static String validatedBody(String bodyJson) {
     Object value = bodyField(bodyJson);
     if (!(value instanceof String)) {
-      throw new BodyFailure(ERR_BODY_REQUIRED);
+      throw new ValidationFailure(ERR_BODY_REQUIRED);
     }
     String trimmed = ((String) value).strip();
     if (trimmed.isEmpty()) {
-      throw new BodyFailure(ERR_BODY_REQUIRED);
+      throw new ValidationFailure(ERR_BODY_REQUIRED);
     }
     if (trimmed.codePointCount(0, trimmed.length()) > 500) {
-      throw new BodyFailure(ERR_BODY_TOO_LONG);
+      throw new ValidationFailure(ERR_BODY_TOO_LONG);
     }
     return trimmed;
   }
@@ -431,17 +480,18 @@ final class Http {
    *
    * <p>Reads run per request against the live handles with no held copy: feed order stays {@code
    * ORDER BY created_at DESC, id DESC} via the SPEC fallback in {@link Db}, and every like count
-   * is read as of its own request. Writes open with {@code BEGIN IMMEDIATE}, run one op, then run
-   * {@code COMMIT} and only afterwards answer, so each response waits for its commit; on commit
-   * failure the single op answers {@code 500}. A busy write lock answers {@code 500} here and
-   * leaves queuing across loop passes to the write owner.
+   * is read as of its own request. Writes are prepared here - auth, then id, then body - and
+   * handed to the write owner, which queues them and answers after the commit that covers
+   * them. A busy write lock never fails a request here: the op waits for the lock.
    *
+   * @param fd the connection the request arrived on
    * @param req the parsed request, never null
    * @param uptimeS whole seconds since the worker started, for the health shape
    * @param auth the E04 verifier hook for authed routes, never null
+   * @param writes the write owner, never null
    * @return the status plus body bytes, never null
    */
-  static Reply handle(Request req, long uptimeS, AuthCheck auth) {
+  static Reply handle(int fd, Request req, long uptimeS, AuthCheck auth, WriteExec writes) {
     Route route = classify(req.method(), req.path());
     switch (route) {
       case HEALTH:
@@ -476,80 +526,83 @@ final class Http {
           return new Reply(500, Json.error(ERR_INTERNAL));
         }
       }
-      case CREATE_POST: {
-        User user;
+      case CREATE_POST:
+      case LIKE: {
+        WriteOp op;
         try {
-          user = requireAuth(req.authorization(), auth);
+          op = prepareWrite(req, auth, route);
         } catch (AuthFailure e) {
           return new Reply(401, Json.error(e.getMessage()));
-        }
-        String trimmed;
-        try {
-          trimmed = validatedBody(req.body());
-        } catch (BodyFailure e) {
+        } catch (ValidationFailure e) {
           return new Reply(400, Json.error(e.getMessage()));
         }
-        try {
-          if (!Db.tryBeginImmediate()) {
-            return new Reply(500, Json.error(ERR_INTERNAL));
-          }
-          Db.CreatedPost created;
-          try {
-            created = Db.insertPostInTxn(user.id(), trimmed);
-          } catch (RuntimeException e) {
-            rollbackQuietly();
-            return new Reply(500, Json.error(ERR_INTERNAL));
-          }
-          if (!Db.commitWrites()) {
-            return new Reply(500, Json.error(ERR_INTERNAL));
-          }
-          Db.PostRow prow =
-              new Db.PostRow(created.id(), trimmed, created.createdAt(), user.username(), 0);
-          return new Reply(201, Json.singlePost(prow));
-        } catch (Exception e) {
-          rollbackQuietly();
-          return new Reply(500, Json.error(ERR_INTERNAL));
-        }
-      }
-      case LIKE: {
-        User user;
-        try {
-          user = requireAuth(req.authorization(), auth);
-        } catch (AuthFailure e) {
-          return new Reply(401, Json.error(e.getMessage()));
-        }
-        String raw =
-            req.path().substring("/posts/".length(), req.path().length() - "/like".length());
-        long id = parsePostId(raw);
-        if (id < 1) {
-          return new Reply(400, Json.error(ERR_INVALID_POST_ID));
-        }
-        try {
-          if (!Db.tryBeginImmediate()) {
-            return new Reply(500, Json.error(ERR_INTERNAL));
-          }
-          Optional<Boolean> result;
-          try {
-            result = Db.insertLikeInTxn(user.id(), id);
-          } catch (RuntimeException e) {
-            rollbackQuietly();
-            return new Reply(500, Json.error(ERR_INTERNAL));
-          }
-          if (!Db.commitWrites()) {
-            return new Reply(500, Json.error(ERR_INTERNAL));
-          }
-          if (result.isEmpty()) {
-            return new Reply(404, Json.error(ERR_POST_NOT_FOUND));
-          }
-          boolean already = result.get();
-          return new Reply(already ? 200 : 201, Json.like(true, already, id));
-        } catch (Exception e) {
-          rollbackQuietly();
-          return new Reply(500, Json.error(ERR_INTERNAL));
-        }
+        return writes.run(fd, op, req.keepAlive());
       }
       default:
         return new Reply(404, Json.error(ERR_NOT_FOUND));
+    }
+  }
+
+  /**
+   * Prepares a write op: auth, then id, then body validation, in SPEC order.
+   *
+   * <p>Nothing here touches the database, so the 401 and 400 answers are immediate. The
+   * op is then queued, and its answer follows the commit that covers it.
+   *
+   * @param req the parsed request, never null
+   * @param auth the verifier hook for authed routes, never null
+   * @param route the write route, CREATE_POST or LIKE
+   * @return the prepared op, never null
+   * @throws AuthFailure with the exact SPEC 401 text
+   * @throws ValidationFailure with the exact SPEC 400 text
+   */
+  static WriteOp prepareWrite(Request req, AuthCheck auth, Route route) {
+    switch (route) {
+      case CREATE_POST -> {
+        User user = requireAuth(req.authorization(), auth);
+        String trimmed = validatedBody(req.body());
+        return new WriteOp(WriteKind.CREATE_POST, user.id(), user.username(), trimmed, 0L);
+      }
+      case LIKE -> {
+        User user = requireAuth(req.authorization(), auth);
+        long id =
+            parsePostId(req.path().substring("/posts/".length(), req.path().length() - "/like".length()));
+        if (id < 1) {
+          throw new ValidationFailure(ERR_INVALID_POST_ID);
+        }
+        return new WriteOp(WriteKind.LIKE, user.id(), user.username(), null, id);
+      }
+      default -> throw new IllegalStateException("not a write route: " + route);
+    }
+  }
+
+  /**
+   * Runs one prepared write op inside the transaction the caller already holds.
+   *
+   * <p>Does not commit: the caller commits, and the answer goes out only after that
+   * commit returns. A failure throws, because the transaction is then unusable and the
+   * whole batch has to fail.
+   *
+   * @param op the prepared op, never null
+   * @return the answer, never null
+   */
+  static Reply executeWrite(WriteOp op) {
+    switch (op.kind()) {
+      case CREATE_POST -> {
+        Db.CreatedPost created = Db.insertPostInTxn(op.userId(), op.body());
+        Db.PostRow row =
+            new Db.PostRow(created.id(), op.body(), created.createdAt(), op.username(), 0L);
+        return new Reply(201, Json.singlePost(row));
+      }
+      case LIKE -> {
+        Optional<Boolean> result = Db.insertLikeInTxn(op.userId(), op.postId());
+        if (result.isEmpty()) {
+          return new Reply(404, Json.error(ERR_POST_NOT_FOUND));
+        }
+        boolean already = result.get();
+        return new Reply(already ? 200 : 201, Json.like(true, already, op.postId()));
+      }
+      default -> throw new IllegalStateException("not a write op: " + op.kind());
     }
   }
 
@@ -600,27 +653,19 @@ final class Http {
     return true;
   }
 
-  private static void rollbackQuietly() {
-    try {
-      Db.rollbackWrites();
-    } catch (RuntimeException ignored) {
-      // Best effort: the 500 answer already carries the failure.
-    }
-  }
-
   /**
    * Extracts the top-level {@code body} field from a create payload.
    *
    * @param bodyJson the raw request body, never null
    * @return the string value, a marker for non-strings, or null when absent
-   * @throws BodyFailure with the malformed text when the JSON is not valid
+   * @throws ValidationFailure with the malformed text when the JSON is not valid
    */
   static Object bodyField(String bodyJson) {
     BodyJson parser = new BodyJson(bodyJson);
     try {
       return parser.parseCreateBody();
     } catch (IllegalArgumentException e) {
-      throw new BodyFailure(ERR_MALFORMED_JSON);
+      throw new ValidationFailure(ERR_MALFORMED_JSON);
     }
   }
 

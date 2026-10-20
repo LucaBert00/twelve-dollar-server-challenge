@@ -19,8 +19,10 @@ import java.nio.file.Path;
  * build can pin the version rather than inheriting whatever the distro ships - PR #73 links
  * Ubuntu's {@code libsqlite3.so.0} and silently gets 3.45.1, nine minor versions behind.
  *
- * <p>Statements are prepared once per connection with {@link #PREPARE_PERSISTENT} and reused
- * with {@code reset}. That caches the query plan, never the data, which rule 5 permits by name.
+ * <p>Statements are prepared once per connection and reused with {@code reset}. That caches
+ * the query plan, never the data, which rule 5 permits by name. They are prepared without
+ * {@code SQLITE_PREPARE_PERSISTENT}: a persistent statement is written into the schema, so
+ * preparing one takes the write lock.
  */
 final class Sqlite {
   static final int OK = 0, ROW = 100, DONE = 101, BUSY = 5;
