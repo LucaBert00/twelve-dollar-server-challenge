@@ -101,12 +101,13 @@ class DbTest {
         Db.POST_EXISTS_SQL);
 
     // Assert: reads and writes only; rule 3 forbids adding or changing
-    // tables, columns, indexes or triggers, so no DDL may appear.
+    // tables, columns, indexes or triggers, so no DDL may appear. The
+    // keywords are matched as whole words, so the column named created_at
+    // is not mistaken for a CREATE statement.
+    Pattern ddl =
+        Pattern.compile("\\b(CREATE|ALTER|DROP|TRIGGER|INDEX)\\b", Pattern.CASE_INSENSITIVE);
     for (String sql : statements) {
-      String upper = sql.toUpperCase();
-      assertTrue(!upper.contains("CREATE") && !upper.contains("ALTER")
-          && !upper.contains("DROP") && !upper.contains("TRIGGER")
-          && !upper.contains("INDEX"), "DDL in: " + sql);
+      assertTrue(!ddl.matcher(sql).find(), "DDL in: " + sql);
     }
     assertTrue(Db.FEED_SQL.contains("ORDER BY p.created_at DESC, p.id DESC LIMIT 20"));
   }

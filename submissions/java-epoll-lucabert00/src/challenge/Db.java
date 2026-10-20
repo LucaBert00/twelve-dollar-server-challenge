@@ -24,9 +24,10 @@ import java.util.Optional;
  * opened on demand for the dedicated checkpoint thread (E05). All handles set the same pragma
  * block on open and fail fast when any value drifts.
  *
- * <p>Statements for request paths are prepared once per handle with
- * {@link Sqlite#PREPARE_PERSISTENT} and reused with {@code reset} plus rebind per use. That
- * reuses the plan and never holds rows.
+ * <p>Statements for request paths are prepared once per handle and reused with {@code reset}
+ * plus rebind per use. That reuses the plan and never holds rows. They are prepared without
+ * {@code SQLITE_PREPARE_PERSISTENT}: a persistent statement is written into the schema, so
+ * preparing one takes the write lock, which the reader handle must never do.
  *
  * <p>Writes use group commit. The caller opens with {@code BEGIN IMMEDIATE}, runs one or more
  * inserts inside the same txn, then runs {@code COMMIT} and only afterwards answers. When
@@ -175,13 +176,13 @@ final class Db {
     Sqlite.initialize();
     writerDb = openDb(sqlitePath, WRITER_BUSY_TIMEOUT_MS, "writer");
     readerDb = openDb(sqlitePath, READER_BUSY_TIMEOUT_MS, "reader");
-    readerHealthStmt = preparePersistent(readerDb, HEALTH_SQL);
-    readerFeedStmt = preparePersistent(readerDb, FEED_SQL);
-    readerGetPostStmt = preparePersistent(readerDb, GET_POST_SQL);
-    readerPostExistsStmt = preparePersistent(readerDb, POST_EXISTS_SQL);
-    writerCreatePostStmt = preparePersistent(writerDb, CREATE_POST_SQL);
-    writerLikeStmt = preparePersistent(writerDb, LIKE_UPSERT_SQL);
-    writerPostExistsStmt = preparePersistent(writerDb, POST_EXISTS_SQL);
+    readerHealthStmt = prepare(readerDb, HEALTH_SQL);
+    readerFeedStmt = prepare(readerDb, FEED_SQL);
+    readerGetPostStmt = prepare(readerDb, GET_POST_SQL);
+    readerPostExistsStmt = prepare(readerDb, POST_EXISTS_SQL);
+    writerCreatePostStmt = prepare(writerDb, CREATE_POST_SQL);
+    writerLikeStmt = prepare(writerDb, LIKE_UPSERT_SQL);
+    writerPostExistsStmt = prepare(writerDb, POST_EXISTS_SQL);
   }
 
   /**
@@ -548,12 +549,25 @@ final class Db {
     }
   }
 
-  private static MemorySegment preparePersistent(MemorySegment db, String sql) {
+  /**
+   * Prepares one statement on a handle and keeps it for reuse.
+   *
+   * <p>Prepared without {@code SQLITE_PREPARE_PERSISTENT}. A persistent statement is written
+   * into the schema, so preparing one takes the write lock: the reader handle must never take
+   * the write lock, and with {@code busy_timeout=0} a sibling worker's startup write would
+   * fail this prepare outright. The plan is still cached on the handle that prepared it, which
+   * is the only reuse this workload does.
+   *
+   * @param db the connection handle
+   * @param sql the statement text
+   * @return the prepared statement handle, never null
+   */
+  private static MemorySegment prepare(MemorySegment db, String sql) {
     MemorySegment ppStmt = Arena.global().allocate(ADDRESS);
     int rc;
     try (Arena arena = Arena.ofConfined()) {
       MemorySegment sqlSeg = toNul(sql, arena);
-      rc = Sqlite.prepareV3(db, sqlSeg, Sqlite.PREPARE_PERSISTENT, ppStmt);
+      rc = Sqlite.prepareV3(db, sqlSeg, 0, ppStmt);
     }
     if (rc != Sqlite.OK) {
       throw new IllegalStateException("prepare failed (" + rc + "): " + Sqlite.errmsg(db));

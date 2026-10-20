@@ -48,7 +48,8 @@ if [ ! -r "$REPO_ROOT/seed/feed.db" ] || [ ! -d "$REPO_ROOT/test/golden" ]; then
 fi
 
 exec "$JAVA" --enable-native-access=ALL-UNNAMED -Xmx512m \
-  -jar "build/${JUNIT_JAR}" \
+  -cp "build/classes:build/test-classes:build/${JUNIT_JAR}" \
+  org.junit.platform.console.ConsoleLauncher \
   --class-path "build/classes:build/test-classes" \
   --select-package challenge \
   "${TAG_ARGS[@]}" \

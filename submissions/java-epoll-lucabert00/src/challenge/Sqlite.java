@@ -25,7 +25,6 @@ import java.nio.file.Path;
 final class Sqlite {
   static final int OK = 0, ROW = 100, DONE = 101, BUSY = 5;
   static final int OPEN_READWRITE = 0x2, OPEN_NOMUTEX = 0x8000, OPEN_EXRESCODE = 0x02000000;
-  static final int PREPARE_PERSISTENT = 0x01;
 
   /**
    * {@code SQLITE_STATIC} as a destructor pointer: SQLite will not copy or free the bound bytes.
