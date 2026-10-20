@@ -39,6 +39,10 @@ final class Sys {
   static final int IPPROTO_TCP = 6, TCP_NODELAY = 1;
   static final int EPOLL_CLOEXEC = 0x80000, EPOLL_CTL_ADD = 1, EPOLL_CTL_MOD = 3;
   static final int EPOLLIN = 0x1, EPOLLOUT = 0x4, EPOLLERR = 0x8, EPOLLHUP = 0x10;
+  // EPOLLRDHUP reports a peer half-close. EPOLLHUP only fires when both directions are shut,
+  // and this server never shuts its write side, so without RDHUP a clean client FIN leaves
+  // the descriptor in CLOSE_WAIT until the eviction watermark is reached.
+  static final int EPOLLRDHUP = 0x2000;
   static final int EINTR = 4, EAGAIN = 11, ENFILE = 23, EMFILE = 24, ECONNABORTED = 103;
 
   private static final boolean X86 =

@@ -404,6 +404,18 @@ final class Server {
         closeConn(fd);
         return;
       }
+      if (get(fd) != c) {
+        // The handler closed this connection. Compare the state object rather than
+        // the descriptor number: a later accept could reuse the number.
+        return;
+      }
+    }
+    if ((flags & Sys.EPOLLRDHUP) != 0) {
+      // The peer half-closed its write side and will send nothing more. The handler has
+      // already drained and answered whatever arrived with the FIN, so the descriptor is
+      // released now rather than sitting in CLOSE_WAIT until the eviction watermark.
+      closeConn(fd);
+      return;
     }
     if ((flags & Sys.EPOLLOUT) != 0 && handler != null && get(fd) != null) {
       get(fd).touch();
@@ -467,7 +479,9 @@ final class Server {
     }
     // TCP_NODELAY on every accepted socket: Nagle plus delayed-ACK lands on the p99 gate.
     Sys.setNoDelay(cfd);
-    if (Sys.epollCtl(epFd, Sys.EPOLL_CTL_ADD, cfd, Sys.EPOLLIN) != 0) {
+    // EPOLLRDHUP as well as EPOLLIN: a peer half-close has to be reported, because the
+    // server never shuts its write side and so EPOLLHUP never fires for a clean FIN.
+    if (Sys.epollCtl(epFd, Sys.EPOLL_CTL_ADD, cfd, Sys.EPOLLIN | Sys.EPOLLRDHUP) != 0) {
       Sys.close(cfd);
       return;
     }
@@ -498,7 +512,16 @@ final class Server {
     return false;
   }
 
-  private void closeConn(int fd) {
+  /**
+   * Closes one connection and releases its descriptor.
+   *
+   * <p>Package-private so the handler can release a connection as soon as the peer
+   * half-closes or a write fails, instead of waiting for the eviction watermark: the
+   * descriptor budget is the score.
+   *
+   * @param fd the connection descriptor
+   */
+  void closeConn(int fd) {
     Conn c = get(fd);
     if (c == null) {
       return;

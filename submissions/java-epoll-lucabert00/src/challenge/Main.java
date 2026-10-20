@@ -106,9 +106,10 @@ public final class Main {
    * {@link Http}, so a failed commit answers {@code 500} for its op.
    *
    * <p>Kept deliberately small on purpose: per-request commit (no cross-loop
-   * batching), blocking writes, and no server-initiated close. The close side
-   * stays with {@link Server} (client FIN, HUP/ERR reap, LRU eviction with
-   * RST). Idle connections therefore hold no heap here — the accumulation
+   * batching) and blocking writes. The close side lives in {@link Server} —
+   * peer half-close, HUP/ERR reap, LRU eviction with RST — and this handler
+   * asks for the close when the peer has gone or the response could not be
+   * written. Idle connections therefore hold no heap here — the accumulation
    * entry is dropped as soon as its bytes are consumed — and idle capacity
    * stays bounded by descriptors, not memory.
    */
@@ -148,6 +149,7 @@ public final class Main {
         return;
       }
       server.setInFlight(fd, true);
+      boolean peerClosed = false;
       try {
         for (; ; ) {
           long r = Sys.read(fd, readSeg, READ_CHUNK);
@@ -160,10 +162,12 @@ public final class Main {
             continue;
           }
           if (r == 0) {
-            // Client FIN. Drop our bytes; the loop reaps its side on HUP.
-            pending.remove(fd);
-            server.setInFlight(fd, false);
-            return;
+            // Peer FIN: the client will send no more bytes. Keep the bytes already buffered
+            // - a request can arrive in the same wakeup as the FIN - answer them, and then
+            // release the descriptor. EPOLLHUP never fires for this, because the server never
+            // shuts its write side, so the half-close is seen exactly here.
+            peerClosed = true;
+            break;
           }
           int e = Sys.errno();
           if (e == Sys.EAGAIN) {
@@ -172,82 +176,95 @@ public final class Main {
           if (e == Sys.EINTR) {
             continue;
           }
+          // A hard read error: the connection is dead. Close it rather than leave the
+          // descriptor in the table until the eviction watermark is reached.
           pending.remove(fd);
-          server.setInFlight(fd, false);
+          server.closeConn(fd);
           return;
         }
 
-        Acc acc = pending.get(fd);
-        if (acc == null || acc.len == 0) {
-          server.setInFlight(fd, false);
+        serveBuffered(fd);
+      } catch (RuntimeException e) {
+        // Never let a handler failure escape into the loop.
+      } finally {
+        if (peerClosed) {
+          pending.remove(fd);
+          server.closeConn(fd);
+        }
+        server.setInFlight(fd, false);
+      }
+    }
+
+    /**
+     * Answers the requests already buffered for one connection.
+     *
+     * <p>Reads one request at a time out of the per-connection accumulation, answers
+     * synchronously, and frames with {@link Out}. The bytes already read stay put: a peer
+     * half-close must not discard a request that arrived in the same wakeup as the FIN.
+     *
+     * @param fd the connection descriptor
+     */
+    private void serveBuffered(int fd) {
+      Acc acc = pending.get(fd);
+      if (acc == null || acc.len == 0) {
+        return;
+      }
+      for (; ; ) {
+        final Http.Parsed parsed;
+        try {
+          parsed = Http.tryParse(acc.buf, 0, acc.len);
+        } catch (Http.TooLargeException e) {
+          sendError(fd, 400, Http.ERR_BODY_TOO_LONG, false);
+          pending.remove(fd);
+          return;
+        } catch (Http.MalformedException e) {
+          sendError(fd, 400, "bad request", false);
+          pending.remove(fd);
           return;
         }
-        for (; ; ) {
-          final Http.Parsed parsed;
-          try {
-            parsed = Http.tryParse(acc.buf, 0, acc.len);
-          } catch (Http.TooLargeException e) {
-            sendError(fd, 400, Http.ERR_BODY_TOO_LONG, false);
+        if (parsed == null) {
+          // Partial request: keep the bytes and stay marked so eviction skips us.
+          return;
+        }
+        Http.Request req = parsed.request();
+        int consumed = parsed.consumed();
+        int remaining = acc.len - consumed;
+        if (remaining > 0) {
+          System.arraycopy(acc.buf, consumed, acc.buf, 0, remaining);
+        }
+        acc.len = remaining;
+        if (acc.len == 0) {
+          pending.remove(fd);
+        }
+        long uptimeS = (System.nanoTime() - startNanos) / 1_000_000_000L;
+        final Http.Reply reply;
+        try {
+          reply = Http.handle(req, uptimeS, Jwt.CHECK);
+        } catch (RuntimeException e) {
+          Http.Reply fallback = new Http.Reply(500, Json.error(Http.ERR_INTERNAL));
+          if (!writeFully(fd, Out.response(fallback.status(), fallback.body(), req.keepAlive()))) {
             pending.remove(fd);
-            server.setInFlight(fd, false);
-            return;
-          } catch (Http.MalformedException e) {
-            sendError(fd, 400, "bad request", false);
-            pending.remove(fd);
-            server.setInFlight(fd, false);
+            server.closeConn(fd);
             return;
           }
-          if (parsed == null) {
-            // Partial request: keep the bytes and stay marked so eviction skips us.
-            return;
-          }
-          Http.Request req = parsed.request();
-          int consumed = parsed.consumed();
-          int remaining = acc.len - consumed;
-          if (remaining > 0) {
-            System.arraycopy(acc.buf, consumed, acc.buf, 0, remaining);
-          }
-          acc.len = remaining;
-          if (acc.len == 0) {
-            pending.remove(fd);
-          }
-          long uptimeS = (System.nanoTime() - startNanos) / 1_000_000_000L;
-          final Http.Reply reply;
-          try {
-            reply = Http.handle(req, uptimeS, Jwt.CHECK);
-          } catch (RuntimeException e) {
-            Http.Reply fallback = new Http.Reply(500, Json.error(Http.ERR_INTERNAL));
-            writeFully(fd, Out.response(fallback.status(), fallback.body(), req.keepAlive()));
-            if (!req.keepAlive()) {
-              pending.remove(fd);
-              server.setInFlight(fd, false);
-              return;
-            }
-            continue;
-          }
-          writeFully(fd, Out.response(reply.status(), reply.body(), req.keepAlive()));
           if (!req.keepAlive()) {
             pending.remove(fd);
-            server.setInFlight(fd, false);
             return;
           }
-          if (acc.len == 0 && pending.get(fd) == null) {
-            break;
-          }
-          acc = pending.get(fd);
-          if (acc == null || acc.len == 0) {
-            break;
-          }
+          continue;
         }
-        Acc after = pending.get(fd);
-        if (after == null || after.len == 0) {
-          server.setInFlight(fd, false);
+        if (!writeFully(fd, Out.response(reply.status(), reply.body(), req.keepAlive()))) {
+          pending.remove(fd);
+          server.closeConn(fd);
+          return;
         }
-      } catch (RuntimeException e) {
-        try {
-          server.setInFlight(fd, false);
-        } catch (RuntimeException ignored) {
-          // Never let a handler failure escape into the loop.
+        if (!req.keepAlive()) {
+          pending.remove(fd);
+          return;
+        }
+        acc = pending.get(fd);
+        if (acc == null || acc.len == 0) {
+          return;
         }
       }
     }
@@ -269,19 +286,28 @@ public final class Main {
 
     private void sendError(int fd, int status, String message, boolean keepAlive) {
       try {
-        writeFully(fd, Out.response(status, Json.error(message), keepAlive));
+        if (!writeFully(fd, Out.response(status, Json.error(message), keepAlive))) {
+          pending.remove(fd);
+          server.closeConn(fd);
+        }
       } catch (RuntimeException ignored) {
         // Client already gone; the loop reaps its side.
       }
     }
 
     /**
-     * Flushes one framed response. Spins briefly on a full send buffer, then
-     * drops rather than stalling the only loop thread behind one slow reader.
-     * Drops are rare — responses are a few kilobytes and readers drain
-     * promptly — and the client retry path, not a hung worker, carries them.
+     * Flushes one framed response.
+     *
+     * <p>Spins briefly on a full send buffer, then gives up rather than stalling the only
+     * loop thread behind one slow reader. The errno read here is the write's own errno,
+     * captured by the downcall, so a real {@code EAGAIN} is never confused with a stale
+     * value left behind by an earlier call.
+     *
+     * @param fd the connection descriptor
+     * @param framed the complete response bytes
+     * @return true when every byte reached the kernel, false when the connection is unusable
      */
-    private void writeFully(int fd, byte[] framed) {
+    private boolean writeFully(int fd, byte[] framed) {
       // Same reason as the read buffer: a downcall will not take a heap segment. Arena.ofAuto frees
       // the block once it becomes unreachable, so no response leaks and the early returns below
       // need no try/finally. One allocation per response is free at this duty cycle (falsifier,
@@ -304,13 +330,17 @@ public final class Main {
         }
         if (e == Sys.EAGAIN) {
           if (++spins > WRITE_SPINS) {
-            return;
+            return false;
           }
           Thread.onSpinWait();
           continue;
         }
-        return;
+        // EPIPE or ECONNRESET means the peer is gone; any other error leaves the connection
+        // unusable too. A half-written response would corrupt the next request on a keep-alive
+        // connection, so the connection goes rather than the bytes.
+        return false;
       }
+      return true;
     }
   }
 

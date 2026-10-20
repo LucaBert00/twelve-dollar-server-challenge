@@ -4,7 +4,9 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
+import java.net.InetSocketAddress;
 import java.net.ServerSocket;
+import java.net.Socket;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -22,6 +24,7 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.MethodOrderer.OrderAnnotation;
@@ -352,6 +355,38 @@ class HttpGateTest {
 
   // HTTP helpers (Act).
 
+  @Test
+  @Order(9)
+  @DisplayName("a client disconnect releases its descriptor")
+  void descriptorReleasedOnPeerFin() throws Exception {
+    // Arrange: the worker's own open descriptor count.
+    int before = countOpenDescriptors(server.pid());
+    Assumptions.assumeTrue(before >= 0, "needs /proc/<pid>/fd (Linux)");
+
+    // Act: one keep-alive request over a raw socket, then close the socket.
+    // Closing sends the peer FIN that EPOLLHUP never reports, because the
+    // server never shuts its own write side.
+    try (Socket socket = new Socket()) {
+      socket.connect(new InetSocketAddress("127.0.0.1", port), 5000);
+      socket.getOutputStream()
+          .write("GET /health HTTP/1.1\r\nHost: gate\r\n\r\n".getBytes(StandardCharsets.US_ASCII));
+      socket.getOutputStream().flush();
+      socket.getInputStream().read(new byte[512]);
+    }
+
+    // Assert: the descriptor comes back. A leaked one would sit in CLOSE_WAIT
+    // until the eviction watermark, and the descriptor budget is the score.
+    long deadline = System.currentTimeMillis() + 5000;
+    int after = countOpenDescriptors(server.pid());
+    while (after > before && System.currentTimeMillis() < deadline) {
+      Thread.sleep(50);
+      after = countOpenDescriptors(server.pid());
+    }
+    assertTrue(
+        after <= before,
+        "the peer half-close must release the descriptor: before=" + before + " after=" + after);
+  }
+
   private static Reply get(String path) throws Exception {
     HttpRequest request = HttpRequest.newBuilder(URI.create(base + path))
         .timeout(Duration.ofSeconds(10)).GET().build();
@@ -406,6 +441,22 @@ class HttpGateTest {
   private static int freePort() throws Exception {
     try (ServerSocket socket = new ServerSocket(0)) {
       return socket.getLocalPort();
+    }
+  }
+
+  /**
+   * Counts the worker's open descriptors.
+   *
+   * @param pid the worker process id
+   * @return the count, or -1 when the process's descriptor directory is not readable
+   */
+  private static int countOpenDescriptors(int pid) throws IOException {
+    Path fdDir = Path.of("/proc", String.valueOf(pid), "fd");
+    if (!Files.isDirectory(fdDir)) {
+      return -1;
+    }
+    try (Stream<Path> entries = Files.list(fdDir)) {
+      return (int) entries.count();
     }
   }
 
