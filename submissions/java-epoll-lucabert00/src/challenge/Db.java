@@ -77,10 +77,13 @@ final class Db {
   /**
    * Like upsert in SPEC reference shape.
    *
-   * <p>Idempotent insert that does nothing on repeat likes.
+   * <p>One statement: the insert is guarded by the post's existence, so a first like runs
+   * no second query. {@code changes()} is 1 for a fresh like and 0 for both a conflict and
+   * a missing post, so a conflict is told apart from a missing post by one existence probe.
    */
   static final String LIKE_UPSERT_SQL =
-      "INSERT INTO likes (user_id, post_id) VALUES (?, ?)"
+      "INSERT INTO likes (user_id, post_id)"
+          + " SELECT ?, ? WHERE EXISTS (SELECT 1 FROM posts WHERE id = ?)"
           + " ON CONFLICT (user_id, post_id) DO NOTHING";
 
   /**
@@ -495,15 +498,30 @@ final class Db {
   static Optional<Boolean> insertLikeInTxn(long userId, long postId) {
     ensureInit();
     try (Arena arena = Arena.ofConfined()) {
+      resetForUse(writerLikeStmt);
+      checkBind(Sqlite.bindInt64(writerLikeStmt, 1, userId), "like bind user");
+      checkBind(Sqlite.bindInt64(writerLikeStmt, 2, postId), "like bind post");
+      checkBind(Sqlite.bindInt64(writerLikeStmt, 3, postId), "like bind exists post");
+      int rc = Sqlite.step(writerLikeStmt);
+      resetAfterUse(writerLikeStmt);
+      if (rc != Sqlite.DONE) {
+        throw new IllegalStateException(
+            "like step failed (" + rc + "): " + Sqlite.errmsg(writerDb));
+      }
+      if (Sqlite.changes(writerDb) == 1) {
+        // A fresh like. This is the common path, and it ran exactly one statement.
+        return Optional.of(Boolean.FALSE);
+      }
+      // No row was inserted: either the like already existed, or the post does not exist.
+      // One existence probe tells them apart.
       resetForUse(writerPostExistsStmt);
       checkBind(Sqlite.bindInt64(writerPostExistsStmt, 1, postId), "like exists bind");
-      int rc = Sqlite.step(writerPostExistsStmt);
-      if (rc != Sqlite.ROW) {
-        resetAfterUse(writerPostExistsStmt);
-        throw new IllegalStateException("like exists step (" + rc + ")");
-      }
-      long n = Sqlite.columnInt64(writerPostExistsStmt, 0);
       rc = Sqlite.step(writerPostExistsStmt);
+      long n = 0;
+      if (rc == Sqlite.ROW) {
+        n = Sqlite.columnInt64(writerPostExistsStmt, 0);
+        rc = Sqlite.step(writerPostExistsStmt);
+      }
       resetAfterUse(writerPostExistsStmt);
       if (rc != Sqlite.DONE) {
         throw new IllegalStateException("like exists trailing step (" + rc + ")");
@@ -511,16 +529,7 @@ final class Db {
       if (n == 0) {
         return Optional.empty();
       }
-      resetForUse(writerLikeStmt);
-      checkBind(Sqlite.bindInt64(writerLikeStmt, 1, userId), "like bind user");
-      checkBind(Sqlite.bindInt64(writerLikeStmt, 2, postId), "like bind post");
-      rc = Sqlite.step(writerLikeStmt);
-      resetAfterUse(writerLikeStmt);
-      if (rc != Sqlite.DONE) {
-        throw new IllegalStateException(
-            "like step failed (" + rc + "): " + Sqlite.errmsg(writerDb));
-      }
-      return Optional.of(Sqlite.changes(writerDb) == 0);
+      return Optional.of(Boolean.TRUE);
     }
   }
 

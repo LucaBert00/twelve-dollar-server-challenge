@@ -258,6 +258,36 @@ class DbTest {
     assertTrue(Db.observedFrames() > 0, "the commit observer must fire on the writer");
   }
 
+  @Test
+  @Order(10)
+  @DisplayName("the like matrix: fresh, already liked, and a missing post")
+  void likeMatrix() throws Exception {
+    // Arrange: a post to like, and an id that does not exist.
+    assertTrue(Db.tryBeginImmediate());
+    Db.CreatedPost post = Db.insertPostInTxn(1, "like me once");
+    assertTrue(Db.commitWrites());
+
+    // Act: the first like, then the same like again, each in its own transaction.
+    assertTrue(Db.tryBeginImmediate());
+    Optional<Boolean> first = Db.insertLikeInTxn(1, post.id());
+    assertTrue(Db.commitWrites());
+    assertTrue(Db.tryBeginImmediate());
+    Optional<Boolean> repeat = Db.insertLikeInTxn(1, post.id());
+    assertTrue(Db.commitWrites());
+
+    // Act: a like on a post that does not exist.
+    assertTrue(Db.tryBeginImmediate());
+    Optional<Boolean> missing = Db.insertLikeInTxn(1, 999999999L);
+    assertTrue(Db.commitWrites());
+
+    // Assert: the first like is fresh, the repeat is already liked, the missing post
+    // is empty (which is the 404), and the post counted the like exactly once.
+    assertTrue(first.isPresent() && !first.get(), "the first like must be a fresh like");
+    assertTrue(repeat.isPresent() && repeat.get(), "the repeat like must be already liked");
+    assertTrue(missing.isEmpty(), "a missing post must not be liked");
+    assertEquals(1, Db.getPost(post.id()).get().likeCount(), "the post must count the like once");
+  }
+
   // Helpers (Arrange).
 
   private static Path firstExisting(Path... candidates) {
