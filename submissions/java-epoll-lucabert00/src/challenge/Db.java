@@ -129,9 +129,10 @@ final class Db {
    * Page cache per writer and reader connection.
    *
    * <p>Negative means KiB rather than pages. This is a session pragma, so it is set and
-   * asserted on every connection.
+   * asserted on every connection. 16 MiB per connection, because the score is connection
+   * capacity and the RAM budget is the binding ceiling.
    */
-  static final int CACHE_SIZE = -65536;
+  static final int CACHE_SIZE = -16384;
 
   /**
    * Page cache for the checkpoint connection.

@@ -20,14 +20,16 @@ import java.util.Objects;
  * worker count instead of stopping at one process's ceiling. The bind uses backlog 4096 and every
  * accepted socket gets TCP_NODELAY.
  *
- * <p>Bytes live in worker-shared buffers, never in per-connection allocations. Each live
- * connection costs one small {@link Conn} (tens of bytes against the 2 KB budget), so idle
- * capacity is bounded by descriptors, not heap.
+ * <p>Bytes live in worker-shared buffers wherever the worker can share them. Each live
+ * connection costs one small {@link Conn} (tens of bytes) plus the kernel socket; the
+ * per-request accumulation buffer is 4 KiB and lives only while a request is partial.
  *
- * <p>Descriptors are never a hard cap. Accept triggers LRU eviction of idle connections on both
- * the budget check and on EMFILE/ENFILE, and evicted connections close with SO_LINGER=0 so the
- * close sends RST instead of accumulating TIME_WAIT. Only connections with no request in flight
- * are ever evicted.
+ * <p>The connection budget has two ceilings, and they are coupled: the descriptor budget and
+ * the RAM budget. The high watermark is the lower of the two, so eviction fires before
+ * whichever ceiling binds. Accept triggers LRU eviction of idle connections on the budget
+ * check and on EMFILE/ENFILE/ENOMEM, and evicted connections close with SO_LINGER=0 so the
+ * close sends RST instead of accumulating TIME_WAIT. Only connections with no request in
+ * flight are ever evicted.
  *
  * <p>The epoll wait timeout derives from the checkpointer pause deadline (E05 contract), so held
  * writes wake on time. This ticket owns sockets only and never produces responses.
@@ -44,6 +46,32 @@ final class Server {
 
   /** epoll_wait timeout with no pause deadline outstanding. */
   static final int DEFAULT_WAIT_MILLIS = 1000;
+
+  /**
+   * Kernel and page-cache headroom reserved for the box, in bytes.
+   *
+   * <p>An estimate, not a measurement. The database's own page cache is reclaimable - the
+   * kernel drops clean pages before it kills anything - but the kernel's slab, the page
+   * tables and the socket structures are not.
+   */
+  static final long KERNEL_RESERVE_BYTES = 192L * 1024 * 1024;
+
+  /**
+   * Kernel cost of one idle TCP socket, in bytes.
+   *
+   * <p>An estimate: the socket structure plus its default receive and send buffers. This is
+   * the number the environment probe's measurement refines, and it is the term the capacity
+   * argument is most sensitive to.
+   */
+  static final long BYTES_PER_IDLE_SOCKET = 5L * 1024;
+
+  /**
+   * JVM overhead beyond the heap, per worker, in bytes.
+   *
+   * <p>An estimate: the class metadata, the code cache, the thread stacks and the direct
+   * buffers.
+   */
+  static final long JVM_OVERHEAD_BYTES = 96L * 1024 * 1024;
 
   /** Worker-shared I/O scratch size in bytes; E03 parses out of this, not per-conn buffers. */
   static final int SHARED_BUF_BYTES = 1 << 16;
@@ -130,6 +158,15 @@ final class Server {
   /** Hysteresis floor for budget eviction. */
   private final int low;
 
+  /** The high watermark the descriptor budget alone allows. */
+  private final int fdHigh;
+
+  /** The high watermark the memory budget alone allows. */
+  private final int memoryHigh;
+
+  /** The box's memory limit in bytes, 0 when it could not be read. */
+  private final long boxBytes;
+
   private Conn[] table;
   private int lruHead = -1;
   private int lruTail = -1;
@@ -154,13 +191,115 @@ final class Server {
     this.port = port;
     this.handler = handler;
     long limit = fdLimit();
-    this.high = highMark(limit);
+    this.fdHigh = highMark(limit);
+    long boxBytes = boxMemoryBytes();
+    int workers = Math.max(1, Integer.getInteger("challenge.workers", 1));
+    this.memoryHigh = memoryHighMark(boxBytes, workers);
+    // The score is connection capacity, and the two ceilings are coupled: the descriptor
+    // budget and the RAM budget. The lower one binds, so take the lower one.
+    this.high = (int) Math.min(fdHigh, memoryHigh);
     this.low = lowMark(high);
+    this.boxBytes = boxBytes;
     int size = (int) Math.min(limit, 1 << 20);
     if (size < 16) {
       size = 16;
     }
     this.table = new Conn[size];
+  }
+
+  /**
+   * Reads the box's memory limit.
+   *
+   * <p>The cgroup limit first, because that is what the box is actually held to; the host
+   * total only as a fallback.
+   *
+   * @return the limit in bytes, or 0 when it cannot be read
+   */
+  static long boxMemoryBytes() {
+    Long cgroup = readLongFile(Path.of("/sys/fs/cgroup/memory.max"));
+    if (cgroup == null) {
+      cgroup = readLongFile(Path.of("/sys/fs/cgroup/memory/memory.limit_in_bytes"));
+    }
+    if (cgroup != null && cgroup > 0 && cgroup < Long.MAX_VALUE / 2) {
+      return cgroup;
+    }
+    Long total = readMemInfoTotal();
+    return total == null ? 0L : total;
+  }
+
+  /**
+   * Derives the memory-based connection high-water for one worker.
+   *
+   * <p>What the box can hold for sockets, after the kernel reserve and every worker's own
+   * fixed reservation, divided by the kernel cost of one idle socket.
+   *
+   * @param boxBytes the box's memory limit, 0 when unknown
+   * @param workers the number of workers sharing the box, at least 1
+   * @return the live-connection count one worker may hold on memory grounds
+   */
+  static int memoryHighMark(long boxBytes, int workers) {
+    if (boxBytes <= 0) {
+      // The box limit could not be read. The descriptor budget alone is the ceiling, and
+      // the eviction watermark stays dormant rather than guessing a RAM budget.
+      return Integer.MAX_VALUE;
+    }
+    long fixed = KERNEL_RESERVE_BYTES + (long) workers * perWorkerFixedBytes();
+    long forSockets = boxBytes - fixed;
+    if (forSockets <= 0) {
+      return 0;
+    }
+    return (int) Math.min(Integer.MAX_VALUE, forSockets / BYTES_PER_IDLE_SOCKET);
+  }
+
+  /**
+   * The fixed memory one worker reserves, in bytes.
+   *
+   * <p>Its heap, its two SQLite page caches and its JVM overhead. The checkpoint
+   * connection gets no page cache, so it adds nothing here.
+   *
+   * @return the reservation in bytes
+   */
+  static long perWorkerFixedBytes() {
+    long heap = Runtime.getRuntime().maxMemory();
+    long sqlite = 2L * -Db.CACHE_SIZE * 1024L;
+    return heap + sqlite + JVM_OVERHEAD_BYTES;
+  }
+
+  /**
+   * Reads one whole-number file, ignoring an "unlimited" marker.
+   *
+   * @param path the file to read
+   * @return the value, or null when the file is missing or not a number
+   */
+  private static Long readLongFile(Path path) {
+    try {
+      String text = Files.readString(path).trim();
+      return Long.parseLong(text);
+    } catch (IOException | RuntimeException e) {
+      return null;
+    }
+  }
+
+  /**
+   * Reads the host's total memory from {@code /proc/meminfo}.
+   *
+   * @return the total in bytes, or null when it cannot be read
+   */
+  private static Long readMemInfoTotal() {
+    try (BufferedReader reader = Files.newBufferedReader(Path.of("/proc/meminfo"))) {
+      String line;
+      while ((line = reader.readLine()) != null) {
+        if (line.startsWith("MemTotal:")) {
+          String[] parts = line.split("\\s+");
+          if (parts.length >= 2) {
+            return Long.parseLong(parts[1]) * 1024L;
+          }
+        }
+      }
+    } catch (IOException | RuntimeException e) {
+      return null;
+    }
+    return null;
   }
 
   /**
@@ -205,10 +344,16 @@ final class Server {
   String startupLine() {
     return "fd-ceiling="
         + fdLimit()
+        + " fd-high="
+        + fdHigh
+        + " mem-high="
+        + memoryHigh
         + " high="
         + high
         + " low="
         + low
+        + " box-bytes="
+        + boxBytes
         + " nofile=["
         + procNoFile()
         + "]";
@@ -490,8 +635,10 @@ final class Server {
         if (e == Sys.EAGAIN) {
           break;
         }
-        if (e == Sys.EMFILE || e == Sys.ENFILE) {
-          // Descriptor-pressure path: shed one idle connection, retry once, then back off.
+        if (e == Sys.EMFILE || e == Sys.ENFILE || e == Sys.ENOMEM) {
+          // Descriptor or memory pressure: shed one idle connection, retry once, then
+          // back off. The accept loop must never stop silently - a server that stops
+          // accepting looks exactly like a hang.
           if (evictIdle()) {
             cfd = Sys.accept(listenFd);
             if (cfd >= 0) {
@@ -499,6 +646,16 @@ final class Server {
               continue;
             }
             if (Sys.errno() == Sys.EAGAIN) {
+              break;
+            }
+          }
+          if (e == Sys.ENOMEM) {
+            // Out of memory: the box cannot take another socket. Back off briefly rather
+            // than spinning on accept.
+            try {
+              Thread.sleep(1);
+            } catch (InterruptedException ie) {
+              Thread.currentThread().interrupt();
               break;
             }
           }

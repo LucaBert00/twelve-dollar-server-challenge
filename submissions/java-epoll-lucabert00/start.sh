@@ -24,8 +24,13 @@ JAVA=/opt/jdk/bin/java
 [ -f "$PWD/build/native/libsqlite3.so" ] || { echo "start.sh: no $PWD/build/native/libsqlite3.so (build.sh first)" >&2; exit 1; }
 
 # 1 vCPU. SerialGC because G1/Parallel spawn GC threads that only contend with request work.
-# -Xms == -Xmx: no heap resizing during the 60 s ramp. Live data is tiny (per-connection state is
-# a few dozen bytes and buffers are shared per worker), so the heap buys a young gen, not retention.
+# -Xms == -Xmx: no heap resizing during the 60 s ramp. The heap buys a young generation, not
+# retention: the score is connection capacity, and the RAM budget is the binding ceiling, so
+# the fixed cost per worker is kept as small as the workload allows. The figure is a
+# placeholder, not a measured optimum - the bench phase owns the tuning.
+# The worker count reaches the worker as a system property so it can divide the box's RAM
+# between the workers sharing it. It is an in-process setting, not a fifth environment
+# variable: the server is configured by SQLITE_PATH, JWT_SECRET, HOST and PORT only.
 JVM_FLAGS=(
   -XX:+UseSerialGC
   -XX:+UseCompactObjectHeaders
@@ -33,7 +38,7 @@ JVM_FLAGS=(
   -XX:-UsePerfData
   -XX:MaxDirectMemorySize=256m
   -XX:ActiveProcessorCount=1
-  -Xms256m -Xmx256m -Xmn64m
+  -Xms128m -Xmx128m
   --enable-native-access=ALL-UNNAMED
 )
 
@@ -41,6 +46,7 @@ pids=()
 for i in $(seq 0 $((WORKERS - 1))); do
   WORKER_ID="$i" "$JAVA" "${JVM_FLAGS[@]}" \
     -Dsqlite.lib="$PWD/build/native/libsqlite3.so" \
+    -Dchallenge.workers="$WORKERS" \
     -cp build/classes challenge.Main &
   pids+=($!)
 done

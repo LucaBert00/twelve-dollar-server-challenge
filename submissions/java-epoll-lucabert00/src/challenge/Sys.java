@@ -43,7 +43,7 @@ final class Sys {
   // and this server never shuts its write side, so without RDHUP a clean client FIN leaves
   // the descriptor in CLOSE_WAIT until the eviction watermark is reached.
   static final int EPOLLRDHUP = 0x2000;
-  static final int EINTR = 4, EAGAIN = 11, ENFILE = 23, EMFILE = 24, ECONNABORTED = 103;
+  static final int EINTR = 4, EAGAIN = 11, ENOMEM = 12, ENFILE = 23, EMFILE = 24, ECONNABORTED = 103;
 
   private static final boolean X86 =
       switch (System.getProperty("os.arch")) {
