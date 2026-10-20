@@ -259,6 +259,13 @@ public final class Main {
      */
     private void flushWrites() {
       while (!writeQueue.isEmpty()) {
+        if (Checkpointer.writesHeld()) {
+          // The checkpointer is holding writes to give the WAL a quiet moment. Reads keep
+          // serving; the writes wait. The pause deadline is what wakes the loop, so no
+          // retry deadline is armed here.
+          server.clearWriteRetryDeadline();
+          return;
+        }
         if (!Db.tryBeginImmediate()) {
           // The write lock is held elsewhere. Keep the queue, wake in a millisecond, and
           // fail only the ops that are past the give-up bound.

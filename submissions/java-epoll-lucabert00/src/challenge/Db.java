@@ -10,12 +10,15 @@ import java.lang.foreign.Linker;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.SymbolLookup;
 import java.lang.invoke.MethodHandle;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.MethodType;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -120,6 +123,98 @@ final class Db {
   static final int BATCH_FAILURE_STATUS = 500;
 
   /**
+   * Page cache per writer and reader connection.
+   *
+   * <p>Negative means KiB rather than pages. This is a session pragma, so it is set and
+   * asserted on every connection.
+   */
+  static final int CACHE_SIZE = -65536;
+
+  /**
+   * Page cache for the checkpoint connection.
+   *
+   * <p>Zero: the checkpoint connection never runs a query, so a page cache for it is pure
+   * waste of the 2 GB budget.
+   */
+  static final int CHECKPOINT_CACHE_SIZE = 0;
+
+  /**
+   * WAL size cap in bytes, applied on every connection.
+   *
+   * <p>Bounds the WAL at 64 MiB alongside the scheduled passive loop.
+   */
+  static final long JOURNAL_SIZE_LIMIT = 67108864L;
+
+  /**
+   * Memory-mapped database size in bytes, applied on every connection.
+   *
+   * <p>The direction of this knob is disputed across the field; 1 GiB is the default
+   * because it is not load-bearing at this duty cycle.
+   */
+  static final long MMAP_SIZE = 1073741824L;
+
+  /**
+   * Last frame count seen by the commit observer on the writer.
+   *
+   * <p>The observer is installed on the writer because the writer is the only connection
+   * that commits. On the checkpoint connection it could never fire.
+   */
+  private static final AtomicInteger OBSERVED_FRAMES = new AtomicInteger();
+
+  /**
+   * Pure observer for {@code sqlite3_wal_hook}.
+   *
+   * <p>Records the frame count and returns 0, doing no I/O and never checkpointing inline.
+   * The commit is never aborted.
+   *
+   * @param pArg unused hook argument, may be null
+   * @param db the connection handle, may be null
+   * @param zDb the database name pointer, may be null
+   * @param nFrames the WAL frame count at commit time
+   * @return 0 always
+   */
+  static int walHookCallback(MemorySegment pArg, MemorySegment db, MemorySegment zDb, int nFrames) {
+    OBSERVED_FRAMES.set(nFrames);
+    return 0;
+  }
+
+  /**
+   * Reports the frame count seen at the most recent commit.
+   *
+   * @return the frame count from the most recent commit on the writer
+   */
+  static int observedFrames() {
+    return OBSERVED_FRAMES.get();
+  }
+
+  /**
+   * Installs the commit-frame observer on a connection.
+   *
+   * @param db the connection handle
+   */
+  private static void installWalHook(MemorySegment db) {
+    try {
+      MethodHandle target =
+          MethodHandles.lookup()
+              .findStatic(
+                  Db.class,
+                  "walHookCallback",
+                  MethodType.methodType(
+                      int.class,
+                      MemorySegment.class,
+                      MemorySegment.class,
+                      MemorySegment.class,
+                      int.class));
+      FunctionDescriptor desc =
+          FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS, JAVA_INT);
+      MemorySegment stub = Linker.nativeLinker().upcallStub(target, desc, Arena.global());
+      Sqlite.setWalHook(db, stub, MemorySegment.NULL);
+    } catch (NoSuchMethodException | IllegalAccessException e) {
+      throw new IllegalStateException(e);
+    }
+  }
+
+  /**
    * One post row as the read handlers consume it.
    *
    * @param id the post id
@@ -176,8 +271,11 @@ final class Db {
       throw new IllegalArgumentException("SQLITE_PATH must name an existing database file");
     }
     Sqlite.initialize();
-    writerDb = openDb(sqlitePath, WRITER_BUSY_TIMEOUT_MS, "writer");
-    readerDb = openDb(sqlitePath, READER_BUSY_TIMEOUT_MS, "reader");
+    writerDb = openDb(sqlitePath, WRITER_BUSY_TIMEOUT_MS, CACHE_SIZE, "writer");
+    readerDb = openDb(sqlitePath, READER_BUSY_TIMEOUT_MS, CACHE_SIZE, "reader");
+    // The commit observer goes on the writer: the writer is the only connection that
+    // commits, so an observer on the checkpoint connection could never fire.
+    installWalHook(writerDb);
     readerHealthStmt = prepare(readerDb, HEALTH_SQL);
     readerFeedStmt = prepare(readerDb, FEED_SQL);
     readerGetPostStmt = prepare(readerDb, GET_POST_SQL);
@@ -190,8 +288,8 @@ final class Db {
   /**
    * Opens a checkpoint handle with the same pragma block for the dedicated thread.
    *
-   * <p>E05 owns the checkpoint schedule. The hook stays a pure observer over
-   * {@code sqlite3_wal_hook} and the thread drives {@code sqlite3_wal_checkpoint_v2}.
+   * <p>E05 owns the checkpoint schedule. The commit observer stays on the writer, and the
+   * thread drives {@code sqlite3_wal_checkpoint_v2}.
    *
    * @param sqlitePath filesystem path to the same database file
    * @return the checkpoint handle, never null
@@ -200,7 +298,7 @@ final class Db {
     if (sqlitePath == null || !Files.isRegularFile(Path.of(sqlitePath))) {
       throw new IllegalArgumentException("SQLITE_PATH must name an existing database file");
     }
-    return openDb(sqlitePath, 0, "checkpoint");
+    return openDb(sqlitePath, 0, CHECKPOINT_CACHE_SIZE, "checkpoint");
   }
 
   /**
@@ -450,7 +548,8 @@ final class Db {
     writerDb = null;
   }
 
-  private static MemorySegment openDb(String sqlitePath, int busyTimeoutMs, String role) {
+  private static MemorySegment openDb(
+      String sqlitePath, int busyTimeoutMs, int cacheSize, String role) {
     try (Arena arena = Arena.ofConfined()) {
       MemorySegment pathSeg = toNul(sqlitePath, arena);
       MemorySegment ppDb = Arena.global().allocate(ADDRESS);
@@ -463,25 +562,27 @@ final class Db {
       if (db == null || db.equals(MemorySegment.NULL)) {
         throw new IllegalStateException(role + " open returned null handle");
       }
-      applyPragmas(db, busyTimeoutMs, role);
-      assertPragmas(db, busyTimeoutMs, role);
+      applyPragmas(db, busyTimeoutMs, cacheSize, role);
+      assertPragmas(db, busyTimeoutMs, cacheSize, role);
       return db;
     }
   }
 
-  private static void applyPragmas(MemorySegment db, int busyTimeoutMs, String role) {
+  private static void applyPragmas(
+      MemorySegment db, int busyTimeoutMs, int cacheSize, String role) {
     execOrThrow(db, "PRAGMA journal_mode=WAL", role);
     execOrThrow(db, "PRAGMA synchronous=NORMAL", role);
     execOrThrow(db, "PRAGMA foreign_keys=ON", role);
     execOrThrow(db, "PRAGMA busy_timeout=" + busyTimeoutMs, role);
     execOrThrow(db, "PRAGMA wal_autocheckpoint=0", role);
-    execOrThrow(db, "PRAGMA journal_size_limit=67108864", role);
-    execOrThrow(db, "PRAGMA mmap_size=1073741824", role);
-    execOrThrow(db, "PRAGMA cache_size=-65536", role);
+    execOrThrow(db, "PRAGMA journal_size_limit=" + JOURNAL_SIZE_LIMIT, role);
+    execOrThrow(db, "PRAGMA mmap_size=" + MMAP_SIZE, role);
+    execOrThrow(db, "PRAGMA cache_size=" + cacheSize, role);
     execOrThrow(db, "PRAGMA temp_store=MEMORY", role);
   }
 
-  private static void assertPragmas(MemorySegment db, int busyTimeoutMs, String role) {
+  private static void assertPragmas(
+      MemorySegment db, int busyTimeoutMs, int cacheSize, String role) {
     String journalMode = pragmaString(db, "PRAGMA journal_mode");
     long synchronous = pragmaLong(db, "PRAGMA synchronous");
     long foreignKeys = pragmaLong(db, "PRAGMA foreign_keys");
@@ -489,7 +590,7 @@ final class Db {
     long autocheckpoint = pragmaLong(db, "PRAGMA wal_autocheckpoint");
     long journalSizeLimit = pragmaLong(db, "PRAGMA journal_size_limit");
     long mmapSize = pragmaLong(db, "PRAGMA mmap_size");
-    long cacheSize = pragmaLong(db, "PRAGMA cache_size");
+    long actualCacheSize = pragmaLong(db, "PRAGMA cache_size");
     long tempStore = pragmaLong(db, "PRAGMA temp_store");
     boolean ok =
         journalMode != null
@@ -498,9 +599,9 @@ final class Db {
             && foreignKeys == 1
             && busyTimeout == busyTimeoutMs
             && autocheckpoint == 0
-            && journalSizeLimit == 67108864L
-            && mmapSize == 1073741824L
-            && cacheSize == -65536L
+            && journalSizeLimit == JOURNAL_SIZE_LIMIT
+            && mmapSize == MMAP_SIZE
+            && actualCacheSize == cacheSize
             && tempStore == 2L;
     if (!ok) {
       throw new IllegalStateException(
@@ -521,7 +622,7 @@ final class Db {
               + " mmap_size="
               + mmapSize
               + " cache_size="
-              + cacheSize
+              + actualCacheSize
               + " temp_store="
               + tempStore);
     }

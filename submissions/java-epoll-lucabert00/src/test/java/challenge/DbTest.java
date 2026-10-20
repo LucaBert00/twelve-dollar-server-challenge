@@ -244,6 +244,20 @@ class DbTest {
     assertTrue(Db.getPost(second.id()).isEmpty());
   }
 
+  @Test
+  @Order(9)
+  @DisplayName("the writer's commit observer fires")
+  void commitObserverFires() throws Exception {
+    // Act: one commit on the writer.
+    assertTrue(Db.tryBeginImmediate());
+    Db.insertPostInTxn(1, "observed");
+    assertTrue(Db.commitWrites());
+
+    // Assert: the observer saw it. On the checkpoint connection it could never fire,
+    // because that connection never commits.
+    assertTrue(Db.observedFrames() > 0, "the commit observer must fire on the writer");
+  }
+
   // Helpers (Arrange).
 
   private static Path firstExisting(Path... candidates) {

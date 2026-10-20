@@ -1,17 +1,10 @@
 package challenge;
 
-import static java.lang.foreign.ValueLayout.ADDRESS;
 import static java.lang.foreign.ValueLayout.JAVA_INT;
 
 import java.lang.foreign.Arena;
-import java.lang.foreign.FunctionDescriptor;
-import java.lang.foreign.Linker;
 import java.lang.foreign.MemorySegment;
-import java.lang.invoke.MethodHandle;
-import java.lang.invoke.MethodHandles;
-import java.lang.invoke.MethodType;
 import java.util.Objects;
-import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * WAL checkpointer that keeps {@code COMMIT} off the fsync path.
@@ -20,10 +13,10 @@ import java.util.concurrent.atomic.AtomicInteger;
  * journal_size_limit=67108864} (see {@link Db}). Auto-checkpoint off without a schedule grows
  * the WAL unbounded, so both halves are mandatory: off plus this scheduled passive loop.
  *
- * <p>The {@code sqlite3_wal_hook} callback is a pure observer: it records the frame count and
- * returns 0, doing no I/O and never checkpointing inline. A dedicated thread with its own
- * connection runs {@code sqlite3_wal_checkpoint_v2} with {@code PASSIVE} on schedule, never
- * inside {@code COMMIT}, so the request loop never stalls on the two fsyncs.
+ * <p>The {@code sqlite3_wal_hook} callback is a pure observer on the writer: it records the
+ * frame count and returns 0, doing no I/O and never checkpointing inline. A dedicated thread
+ * with its own connection runs {@code sqlite3_wal_checkpoint_v2} with {@code PASSIVE} on
+ * schedule, never inside {@code COMMIT}, so the request loop never stalls on the two fsyncs.
  *
  * <p>Whether the checkpoint copied the whole WAL is the {@code log == done} test on the
  * {@code pnLog}/{@code pnCkpt} out-params: equal means the WAL restarted. Two phases: phase A
@@ -52,13 +45,6 @@ final class Checkpointer {
   static final long PAUSE_MAX_MILLIS = 20;
 
   /**
-   * WAL size cap in bytes applied on every connection.
-   *
-   * <p>Bounds the WAL at 67108864 bytes alongside the scheduled passive loop.
-   */
-  static final long JOURNAL_SIZE_LIMIT = 67108864L;
-
-  /**
    * Checkpoint mode for {@code sqlite3_wal_checkpoint_v2}.
    *
    * <p>{@code PASSIVE} never blocks writers and returns {@code SQLITE_BUSY} when it cannot make
@@ -66,58 +52,38 @@ final class Checkpointer {
    */
   static final int CHECKPOINT_PASSIVE = 0;
 
-  /** Last frame count seen by the {@code sqlite3_wal_hook} observer. */
-  private static final AtomicInteger OBSERVED_FRAMES = new AtomicInteger();
-
-  /** {@link System#nanoTime} instant until which writes are held, or 0 when none. */
+  /**
+   * {@link System#nanoTime} instant until which writes are held, or 0 when none.
+   */
   private static volatile long writesHeldUntilNanos;
 
   private final Server server;
-  private final String sqlitePath;
   private final MemorySegment checkpointDb;
-  private final MemorySegment walHookStub;
   private volatile boolean running;
   private Thread thread;
 
   /**
    * Creates a checkpointer for one worker.
    *
-   * <p>Opens its own connection with the same pragma block and installs the {@code
-   * sqlite3_wal_hook} pure observer on it.
+   * <p>Opens its own connection with the same pragma block. The commit-frame observer
+   * lives on the writer, in {@link Db}, because the writer is the only connection that
+   * commits.
    *
    * @param server the event loop whose wait timeout derives from the pause deadline, never null
    * @param sqlitePath filesystem path to the same database file, never null
    */
   Checkpointer(Server server, String sqlitePath) {
     this.server = Objects.requireNonNull(server, "server");
-    this.sqlitePath = Objects.requireNonNull(sqlitePath, "sqlitePath");
     this.checkpointDb = Db.openCheckpointConnection(sqlitePath);
-    this.walHookStub = installWalHook(checkpointDb);
   }
 
   /**
-   * Pure observer for {@code sqlite3_wal_hook}.
+   * Reports the frame count seen at the most recent commit.
    *
-   * <p>Records the frame count and returns 0, doing no I/O and never checkpointing inline.
-   *
-   * @param pArg unused hook argument, may be null
-   * @param db the connection handle, may be null
-   * @param zDb the database name pointer, may be null
-   * @param nFrames the WAL frame count at commit time
-   * @return 0 always, so the commit is never aborted
-   */
-  static int walHookCallback(MemorySegment pArg, MemorySegment db, MemorySegment zDb, int nFrames) {
-    OBSERVED_FRAMES.set(nFrames);
-    return 0;
-  }
-
-  /**
-   * Reports the last frame count seen by the observer.
-   *
-   * @return the frame count from the most recent commit hook firing
+   * @return the frame count from the most recent commit on the writer
    */
   static int observedFrames() {
-    return OBSERVED_FRAMES.get();
+    return Db.observedFrames();
   }
 
   /**
@@ -233,11 +199,14 @@ final class Checkpointer {
 
   /**
    * Arms the writes-only pause and shortens the loop wait via the server deadline.
+   *
+   * <p>The server deadline is armed first, so a reader that sees the hold also sees the
+   * deadline that will wake it.
    */
   private void armPauseDeadline() {
     long deadline = System.nanoTime() + PAUSE_MAX_MILLIS * 1_000_000L;
-    writesHeldUntilNanos = deadline;
     server.setPauseDeadlineNanos(deadline);
+    writesHeldUntilNanos = deadline;
   }
 
   /**
@@ -246,28 +215,5 @@ final class Checkpointer {
   private void clearPauseDeadline() {
     writesHeldUntilNanos = 0;
     server.clearPauseDeadline();
-  }
-
-  private static MemorySegment installWalHook(MemorySegment db) {
-    try {
-      MethodHandle target =
-          MethodHandles.lookup()
-              .findStatic(
-                  Checkpointer.class,
-                  "walHookCallback",
-                  MethodType.methodType(
-                      int.class,
-                      MemorySegment.class,
-                      MemorySegment.class,
-                      MemorySegment.class,
-                      int.class));
-      FunctionDescriptor desc =
-          FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS, JAVA_INT);
-      MemorySegment stub = Linker.nativeLinker().upcallStub(target, desc, Arena.global());
-      Sqlite.setWalHook(db, stub, MemorySegment.NULL);
-      return stub;
-    } catch (NoSuchMethodException | IllegalAccessException e) {
-      throw new IllegalStateException(e);
-    }
   }
 }
