@@ -207,6 +207,43 @@ class DbTest {
         Json.postObject(feed.get(0)));
   }
 
+  @Test
+  @Order(7)
+  @DisplayName("one commit covers a whole batch of ops")
+  void groupCommitCoversTheBatch() throws Exception {
+    // Arrange: the commit count before the batch.
+    long before = Db.commitCount();
+
+    // Act: two posts inside one transaction, one commit.
+    assertTrue(Db.tryBeginImmediate());
+    Db.CreatedPost first = Db.insertPostInTxn(1, "batch one");
+    Db.CreatedPost second = Db.insertPostInTxn(2, "batch two");
+    assertTrue(Db.commitWrites());
+
+    // Assert: one commit covered both ops, and both are visible.
+    assertEquals(before + 1, Db.commitCount(), "one commit covers the whole batch");
+    assertTrue(Db.getPost(first.id()).isPresent(), "the first op must be visible");
+    assertTrue(Db.getPost(second.id()).isPresent(), "the second op must be visible");
+  }
+
+  @Test
+  @Order(8)
+  @DisplayName("a rolled back batch leaves nothing visible")
+  void batchFailure() throws Exception {
+    // Assert: the batch failure status is 500 for every op in the batch.
+    assertEquals(500, Db.BATCH_FAILURE_STATUS);
+
+    // Act: two posts inside one transaction, rolled back.
+    assertTrue(Db.tryBeginImmediate());
+    Db.CreatedPost first = Db.insertPostInTxn(1, "rolled back one");
+    Db.CreatedPost second = Db.insertPostInTxn(2, "rolled back two");
+    Db.rollbackWrites();
+
+    // Assert: neither op is visible. The batch failed, so neither op happened.
+    assertTrue(Db.getPost(first.id()).isEmpty(), "a rolled back op must not be visible");
+    assertTrue(Db.getPost(second.id()).isEmpty());
+  }
+
   // Helpers (Arrange).
 
   private static Path firstExisting(Path... candidates) {

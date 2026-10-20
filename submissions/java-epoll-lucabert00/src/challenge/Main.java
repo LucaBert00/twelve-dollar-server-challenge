@@ -5,9 +5,11 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.net.InetAddress;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -245,10 +247,15 @@ public final class Main {
     /**
      * Runs the queued write ops.
      *
-     * <p>One {@code BEGIN IMMEDIATE} per op. On {@code SQLITE_BUSY} the queue is kept, the
-     * loop is asked to wake in a millisecond, and an op that has waited past the give-up
-     * bound is failed with {@code 500}. The answer for an op goes out only after the
-     * commit that covers it.
+     * <p>One {@code BEGIN IMMEDIATE} per batch. The whole queue is taken, every op runs
+     * inside the same transaction, and the answers go out only after the commit that
+     * covers them. On {@code SQLITE_BUSY} the queue is kept, the loop is asked to wake in
+     * a millisecond, and an op that has waited past the give-up bound is failed with
+     * {@code 500}.
+     *
+     * <p>A failed commit answers {@code 500} for every op in the batch and closes nothing.
+     * A closed connection with no answer becomes a client timeout, and a client timeout
+     * becomes a retry - which is load added exactly when the box is already saturated.
      */
     private void flushWrites() {
       while (!writeQueue.isEmpty()) {
@@ -260,28 +267,62 @@ public final class Main {
             PendingWrite queued = it.next();
             if (Db.writeGiveUp(queued.queuedAtNanos)) {
               it.remove();
-              answer(queued, new Http.Reply(500, Json.error(Http.ERR_INTERNAL)));
+              answer(queued, batchFailure());
             }
           }
           server.setWriteRetryDeadlineNanos(now + WRITE_RETRY_NANOS);
           return;
         }
-        PendingWrite queued = writeQueue.poll();
-        Http.Reply reply;
-        try {
-          reply = Http.executeWrite(queued.op);
-        } catch (RuntimeException e) {
-          Db.rollbackWrites();
-          answer(queued, new Http.Reply(500, Json.error(Http.ERR_INTERNAL)));
+        // Take the whole queue: one transaction, one commit, one answer per op.
+        int count = writeQueue.size();
+        List<PendingWrite> batch = new ArrayList<>(count);
+        List<Http.Reply> replies = new ArrayList<>(count);
+        for (int i = 0; i < count; i++) {
+          batch.add(writeQueue.poll());
+        }
+        boolean failed = false;
+        for (PendingWrite queued : batch) {
+          try {
+            replies.add(Http.executeWrite(queued.op));
+          } catch (RuntimeException e) {
+            failed = true;
+            break;
+          }
+        }
+        if (failed) {
+          // The transaction is unusable. Roll the batch back and fail all of it.
+          try {
+            Db.rollbackWrites();
+          } catch (RuntimeException ignored) {
+            // Best effort: the 500-for-batch answer carries the failure.
+          }
+          for (PendingWrite queued : batch) {
+            answer(queued, batchFailure());
+          }
           return;
         }
         if (!Db.commitWrites()) {
-          answer(queued, new Http.Reply(500, Json.error(Http.ERR_INTERNAL)));
+          // The commit failed, so every op in the batch failed with it. The rollback
+          // already happened inside commitWrites.
+          for (PendingWrite queued : batch) {
+            answer(queued, batchFailure());
+          }
           return;
         }
-        answer(queued, reply);
+        for (int i = 0; i < batch.size(); i++) {
+          answer(batch.get(i), replies.get(i));
+        }
       }
       server.clearWriteRetryDeadline();
+    }
+
+    /**
+     * The answer for an op whose batch did not commit.
+     *
+     * @return a 500 with the SPEC internal error text
+     */
+    private static Http.Reply batchFailure() {
+      return new Http.Reply(Db.BATCH_FAILURE_STATUS, Json.error(Http.ERR_INTERNAL));
     }
 
     /**

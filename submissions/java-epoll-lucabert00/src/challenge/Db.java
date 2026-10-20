@@ -16,6 +16,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * SQLite owner over FFM against the amalgamation that {@code build.sh} compiles.
@@ -29,9 +30,10 @@ import java.util.Optional;
  * {@code SQLITE_PREPARE_PERSISTENT}: a persistent statement is written into the schema, so
  * preparing one takes the write lock, which the reader handle must never do.
  *
- * <p>A write opens with {@code BEGIN IMMEDIATE}, runs its inserts inside the same txn,
- * then runs {@code COMMIT}, and the answer goes out only after that commit returns. When
- * the commit fails the caller answers {@code 500} for the op it held.
+ * <p>Writes use group commit. The caller opens with {@code BEGIN IMMEDIATE}, runs the whole
+ * batch of inserts inside the same txn, then runs {@code COMMIT}, and the answer for each op
+ * goes out only after that commit returns. When the commit fails the caller answers
+ * {@code 500} for every op in the batch.
  */
 final class Db {
   /**
@@ -219,6 +221,23 @@ final class Db {
   }
 
   /**
+   * Commits this worker has completed.
+   *
+   * <p>A batch of N ops adds exactly one. It is the observable that proves a group
+   * commit really shared a transaction.
+   */
+  private static final AtomicLong COMMITS = new AtomicLong();
+
+  /**
+   * Reports how many commits this worker has completed.
+   *
+   * @return the commit count
+   */
+  static long commitCount() {
+    return COMMITS.get();
+  }
+
+  /**
    * Commits the current write txn.
    *
    * @return true on {@code COMMIT}, false on failure when the caller must answer {@code 500} for
@@ -227,6 +246,7 @@ final class Db {
   static boolean commitWrites() {
     int rc = execRaw(writerDb, "COMMIT");
     if (rc == Sqlite.OK) {
+      COMMITS.incrementAndGet();
       return true;
     }
     try {
