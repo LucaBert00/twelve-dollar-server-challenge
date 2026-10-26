@@ -15,7 +15,9 @@ Build: `submissions/java-epoll-lucabert00` on `main`, commit `bcaff56`.
 bash seed/make-seed.sh
 rm -f /tmp/bench.db && cp seed/feed.db /tmp/bench.db
 
-# 1. Build, as a normal user. This also runs the JUnit suite.
+# 1. Build, as a normal user. This also runs the JUnit suite: once against an
+#    instrumented SQLite to collect the profile, then again against the
+#    -fprofile-use library that ships. Needs seed/feed.db from step 0.
 bash submissions/java-epoll-lucabert00/build.sh
 
 # 2. Start THIS build on the fresh copy.
@@ -37,6 +39,21 @@ kill in one command, and it is what CI runs on every push:
 ```bash
 bash test/run.sh submissions/java-epoll-lucabert00   # IS the verification
 ```
+
+## The two-phase SQLite build
+
+`build.sh` compiles SQLite 3.54.0 twice. The first compile is instrumented
+(`-fprofile-generate=build/pgo -fprofile-update=atomic`) and is installed only
+so the JUnit gate can train it; the second compile consumes that profile
+(`-fprofile-use=build/pgo -Werror=missing-profile -Werror=coverage-mismatch`)
+and is the library the server ships. The profile lives under the git-ignored
+`build/`, is deleted before every generation, and a gate that leaves no
+`.gcda` behind fails the build. A missing or incompatible profile is a hard
+failure: there is no silent `-O2` fallback. `build/sqlite.stamp` records both
+flag sets plus the `pgo=two-phase-gate` marker, so any flag change rebuilds.
+
+The gate is the training workload, so the build needs `seed/feed.db` and
+`test/golden/` - the same prerequisite as the gate itself (step 0 above).
 
 ## The JUnit harness
 
