@@ -1,6 +1,6 @@
 # CHECKLIST - the rule 5 and rule 6 code read
 
-Build: `submissions/java-epoll-lucabert00` on `main`, commit `bcaff56`.
+Build: `submissions/java-epoll-lucabert00` on `main`, as of issue #52.
 Read against `src/challenge/` only. Re-sign per variant.
 
 ## Rule 5 - no cross-request caching
@@ -57,6 +57,32 @@ OS page cache and `mmap`.
       reader take the write lock.
 - [x] The pragma block is asserted **per role**, so a drift on the checkpoint
       connection fails fast at startup too.
+
+## Failure paths
+
+- [x] **Accept pressure does not allocate.** `FailurePathTest.acceptPressureAllocatesNothing`
+      launches `AcceptPressureProbe` in a child JVM under `ulimit -n 512`. The probe fills every
+      descriptor, leaves one connection in the accept queue with no idle connection to evict, and
+      proves `accept4` fails `EMFILE`. It then measures 50,000 `Server.acceptAll` passes after a
+      50,000-pass warmup on `com.sun.management.ThreadMXBean.getThreadAllocatedBytes`: **0 bytes**,
+      exact, no tolerance. `Server.acceptAll:644-695` shares that branch with `ENFILE` and
+      `ENOMEM`; the branch calls `evictIdle` once and breaks - no string, log or object.
+- [x] **LRU eviction allocates nothing.** `Sys.lingerZero` (`Sys.java:181-188`) writes the
+      prebuilt `Sys.LINGER` pair (`Sys.java:96`) and calls `setsockopt`; it no longer slices the
+      scratch segment per eviction. `EvictionAllocProbe` runs under `-Xint`, where escape analysis
+      cannot hide the object, and measures 10,000 calls after 10,000 warmup: **0 bytes**. The
+      earlier shape measured **32 bytes per call** under the same probe, which is why the slice
+      was hoisted. `Server.evictIdle:721-736` and `Server.closeConn:747-757` only walk int fields
+      and LRU links and call `close(2)`: no logging, no string formatting, no per-eviction object.
+- [x] **A failed COMMIT answers `500` for every queued op and closes nothing.**
+      `FailurePathTest.commitFailureAnswersEveryQueuedOp` makes a real commit fail with
+      `PRAGMA defer_foreign_keys=ON` and two inserts for a nonexistent user. Both clients receive
+      the byte-exact 33-byte body `{"error":"internal server error"}` with
+      `Connection: keep-alive`; `Db.commitCount()` does not move; `activeCount` stays 2; both
+      peers stay open (a 300 ms read times out instead of returning EOF); and the same two
+      descriptors then commit two valid `201` responses. `Main.flushWrites:311-318` answers every
+      op in the batch with `batchFailure()` and returns; `Main.answer:344-356` closes only when
+      the write itself fails.
 
 ## JWT strictness
 

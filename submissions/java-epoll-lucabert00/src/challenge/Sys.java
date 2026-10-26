@@ -92,6 +92,8 @@ final class Sys {
   private static final MemorySegment STATE = Arena.global().allocate(STATE_LAYOUT);
   /** Scratch space for out-arguments: sockaddr at 0, setsockopt ints at 32, linger pair at 40. */
   private static final MemorySegment SCRATCH = Arena.global().allocate(64, 8);
+  /** The linger pair, sliced once: {@code asSlice} allocates per call under the interpreter. */
+  private static final MemorySegment LINGER = SCRATCH.asSlice(40, 8);
 
   private Sys() {}
 
@@ -180,7 +182,7 @@ final class Sys {
     SCRATCH.set(JAVA_INT, 40, 1);
     SCRATCH.set(JAVA_INT, 44, 0);
     try {
-      SETSOCKOPT.invokeExact(fd, SOL_SOCKET, SO_LINGER, SCRATCH.asSlice(40, 8), 8);
+      SETSOCKOPT.invokeExact(fd, SOL_SOCKET, SO_LINGER, LINGER, 8);
     } catch (Throwable t) {
       throw rethrow(t);
     }
