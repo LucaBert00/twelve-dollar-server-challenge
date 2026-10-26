@@ -75,6 +75,14 @@ Top-down, in the order that matters:
     `COMMIT`; a failed commit answers `500` for its op. Batching several
     requests into one commit is permitted and left as future work — the
     current wiring commits per request, which is the correct slow baseline.
+11. **Range-scan feed with the reference fallback.** `/feed` is 46 % of
+    traffic. The fast path reads the 20 newest ids from the covering index,
+    then takes a primary-key range only when those ids are exactly contiguous
+    (`count == 20 && max - min == 19`); any gap runs the immutable reference
+    SQL. The range path sorts its 20 rows, so the plan — not an assumed id
+    order — is recorded in `docs/EXPLAIN_QUERY_PLAN.md`. The gate compares
+    both paths byte for byte; correctness, not a speed claim, is what it
+    proves.
 
 Deliberately not done: GraalVM native image (OOM risk on the 2 GB build
 box), a third worker (worsens WAL contention), kernel tuning or CPU pinning

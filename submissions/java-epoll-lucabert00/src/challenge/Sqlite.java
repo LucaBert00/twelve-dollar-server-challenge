@@ -63,6 +63,8 @@ final class Sqlite {
   private static final MethodHandle FINALIZE = fn("sqlite3_finalize", FunctionDescriptor.of(JAVA_INT, ADDRESS));
   private static final MethodHandle CLEAR_BINDINGS =
       fn("sqlite3_clear_bindings", FunctionDescriptor.of(JAVA_INT, ADDRESS));
+  private static final MethodHandle CLOSE =
+      fn("sqlite3_close", FunctionDescriptor.of(JAVA_INT, ADDRESS));
   private static final MethodHandle ERRMSG = fn("sqlite3_errmsg", FunctionDescriptor.of(ADDRESS, ADDRESS));
   private static final MethodHandle CHANGES =
       fn("sqlite3_changes", FunctionDescriptor.of(JAVA_INT, ADDRESS), SAFE);
@@ -173,6 +175,15 @@ final class Sqlite {
   static int finalizeStmt(MemorySegment stmt) {
     try {
       return (int) FINALIZE.invokeExact(stmt);
+    } catch (Throwable t) {
+      throw rethrow(t);
+    }
+  }
+
+  /** Closes one connection handle. Statements on it must be finalized first. */
+  static int close(MemorySegment db) {
+    try {
+      return (int) CLOSE.invokeExact(db);
     } catch (Throwable t) {
       throw rethrow(t);
     }

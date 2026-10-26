@@ -67,9 +67,11 @@ CI covers it without any file outside this folder changing.
 | `JsonTest` | gate | key order, escaping, the wrappers |
 | `AuthTest` | gate | the auth matrix, the `positiveInteger` id partition |
 | `DbTest` | gate | goldens, pragmas, schema, the id matrix, create/like/read-back, the feed of 20, the group commit, the batch failure, the commit observer, the like matrix |
+| `FeedPathTest` | gate | the fast path and the reference SQL agree byte for byte across seed, fresh, equal timestamps, gaps, a missing row, and the 19/20/21-row boundary |
 | `HttpGateTest` | gate | the HTTP black-box mirror of `test/test.sh`, plus the descriptor release on peer FIN and the busy write lock |
 | `ServerTest` | gate | the connection budget arithmetic and the wait timeout |
 | `BenchSmokeTest` | bench | the tag separation only (no benchmarking here) |
+| `TestSqlite` | helper | test-only schema and fixture setup over the same FFM bindings |
 | `TestTokens` | helper | an independent HS256 signer, not the verifier |
 
 ```bash

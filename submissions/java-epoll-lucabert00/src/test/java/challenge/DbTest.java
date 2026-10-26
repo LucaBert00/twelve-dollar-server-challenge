@@ -94,6 +94,8 @@ class DbTest {
     List<String> statements = List.of(
         Db.SELECT_POST_BASE,
         Db.FEED_SQL,
+        Db.FEED_IDS_SQL,
+        Db.FEED_RANGE_SQL,
         Db.GET_POST_SQL,
         Db.CREATE_POST_SQL,
         Db.LIKE_UPSERT_SQL,

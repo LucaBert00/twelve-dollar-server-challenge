@@ -8,7 +8,6 @@ import java.lang.foreign.Arena;
 import java.lang.foreign.FunctionDescriptor;
 import java.lang.foreign.Linker;
 import java.lang.foreign.MemorySegment;
-import java.lang.foreign.SymbolLookup;
 import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
@@ -58,6 +57,25 @@ final class Db {
    * <p>Base plus newest-first ordering on the covering index with limit 20.
    */
   static final String FEED_SQL = SELECT_POST_BASE + " ORDER BY p.created_at DESC, p.id DESC LIMIT 20";
+
+  /**
+   * Feed id discovery for the fast path.
+   *
+   * <p>Only the 20 newest ids, in reference order, so the covering index is read without
+   * touching a row body, a username, or a like count.
+   */
+  static final String FEED_IDS_SQL =
+      "SELECT id FROM posts ORDER BY created_at DESC, id DESC LIMIT 20";
+
+  /**
+   * Feed range query for the fast path.
+   *
+   * <p>The same projection, join and ordering as {@link #FEED_SQL}, restricted to the id window
+   * that {@link #FEED_IDS_SQL} proved contiguous. Primary-key range lookups instead of an index
+   * walk, and the reference ordering is kept so the bytes are identical.
+   */
+  static final String FEED_RANGE_SQL =
+      SELECT_POST_BASE + " WHERE p.id BETWEEN ? AND ? ORDER BY p.created_at DESC, p.id DESC";
 
   /**
    * Single-post lookup in SPEC reference shape.
@@ -237,20 +255,13 @@ final class Db {
    */
   static record CreatedPost(long id, String createdAt) {}
 
-  private static final Linker LINKER = Linker.nativeLinker();
-  private static final SymbolLookup NATIVE_LIB =
-      SymbolLookup.libraryLookup(
-          Path.of(System.getProperty("sqlite.lib", "build/native/libsqlite3.so")), Arena.global());
-  private static final MethodHandle CLOSE_HANDLE =
-      LINKER.downcallHandle(
-          NATIVE_LIB.find("sqlite3_close").orElseThrow(() -> new UnsatisfiedLinkError("sqlite3_close")),
-          FunctionDescriptor.of(JAVA_INT, ADDRESS));
-
   private static MemorySegment writerDb;
   private static MemorySegment readerDb;
 
   private static MemorySegment readerHealthStmt;
   private static MemorySegment readerFeedStmt;
+  private static MemorySegment readerFeedIdsStmt;
+  private static MemorySegment readerFeedRangeStmt;
   private static MemorySegment readerGetPostStmt;
   private static MemorySegment readerPostExistsStmt;
 
@@ -282,6 +293,8 @@ final class Db {
     installWalHook(writerDb);
     readerHealthStmt = prepare(readerDb, HEALTH_SQL);
     readerFeedStmt = prepare(readerDb, FEED_SQL);
+    readerFeedIdsStmt = prepare(readerDb, FEED_IDS_SQL);
+    readerFeedRangeStmt = prepare(readerDb, FEED_RANGE_SQL);
     readerGetPostStmt = prepare(readerDb, GET_POST_SQL);
     readerPostExistsStmt = prepare(readerDb, POST_EXISTS_SQL);
     writerCreatePostStmt = prepare(writerDb, CREATE_POST_SQL);
@@ -402,9 +415,84 @@ final class Db {
   /**
    * Reads the 20 newest posts for {@code GET /feed}.
    *
+   * <p>Tries the contiguous-range fast path first; any gap, short feed, or changed window runs
+   * the immutable reference SQL unchanged.
+   *
    * @return the 20 newest rows in wire order, never null
    */
   static List<PostRow> feed() {
+    ensureInit();
+    return feedFastPath().orElseGet(Db::feedReference);
+  }
+
+  /**
+   * Tries the contiguous-range fast path for {@code GET /feed}.
+   *
+   * <p>{@code count == 20 && max - min == 19} with distinct primary keys proves the newest 20
+   * ids are exactly {@code min..max}, so one primary-key range scan is the same row set the
+   * reference query would walk the covering index for. The ordering is repeated in the range
+   * query, not assumed from the id window. A window that lost a row between the two statements
+   * answers empty so the caller can run the reference SQL. The two statements are two read
+   * snapshots: a post committed between them is picked up by the next request, not this one.
+   *
+   * @return the rows when the newest window is contiguous, otherwise empty
+   */
+  static Optional<List<PostRow>> feedFastPath() {
+    ensureInit();
+    long min = Long.MAX_VALUE;
+    long max = Long.MIN_VALUE;
+    int count = 0;
+    resetForUse(readerFeedIdsStmt);
+    for (; ; ) {
+      int rc = Sqlite.step(readerFeedIdsStmt);
+      if (rc == Sqlite.DONE) {
+        break;
+      }
+      if (rc != Sqlite.ROW) {
+        resetAfterUse(readerFeedIdsStmt);
+        throw new IllegalStateException("feed ids step failed (" + rc + ")");
+      }
+      long id = Sqlite.columnInt64(readerFeedIdsStmt, 0);
+      count++;
+      if (id < min) {
+        min = id;
+      }
+      if (id > max) {
+        max = id;
+      }
+    }
+    resetAfterUse(readerFeedIdsStmt);
+    if (count != 20 || max - min != 19) {
+      return Optional.empty();
+    }
+    List<PostRow> out = new ArrayList<>(20);
+    resetForUse(readerFeedRangeStmt);
+    checkBind(Sqlite.bindInt64(readerFeedRangeStmt, 1, min), "feed range bind min");
+    checkBind(Sqlite.bindInt64(readerFeedRangeStmt, 2, max), "feed range bind max");
+    for (; ; ) {
+      int rc = Sqlite.step(readerFeedRangeStmt);
+      if (rc == Sqlite.DONE) {
+        break;
+      }
+      if (rc != Sqlite.ROW) {
+        resetAfterUse(readerFeedRangeStmt);
+        throw new IllegalStateException("feed range step failed (" + rc + ")");
+      }
+      out.add(mapPost(readerFeedRangeStmt));
+    }
+    resetAfterUse(readerFeedRangeStmt);
+    if (out.size() != 20) {
+      return Optional.empty();
+    }
+    return Optional.of(out);
+  }
+
+  /**
+   * Reads the feed with the immutable SPEC reference SQL.
+   *
+   * @return the 20 newest rows in wire order, never null
+   */
+  static List<PostRow> feedReference() {
     ensureInit();
     List<PostRow> out = new ArrayList<>(20);
     resetForUse(readerFeedStmt);
@@ -540,6 +628,8 @@ final class Db {
   static synchronized void close() {
     finalizeQuietly(readerHealthStmt);
     finalizeQuietly(readerFeedStmt);
+    finalizeQuietly(readerFeedIdsStmt);
+    finalizeQuietly(readerFeedRangeStmt);
     finalizeQuietly(readerGetPostStmt);
     finalizeQuietly(readerPostExistsStmt);
     finalizeQuietly(writerCreatePostStmt);
@@ -547,6 +637,8 @@ final class Db {
     finalizeQuietly(writerPostExistsStmt);
     readerHealthStmt = null;
     readerFeedStmt = null;
+    readerFeedIdsStmt = null;
+    readerFeedRangeStmt = null;
     readerGetPostStmt = null;
     readerPostExistsStmt = null;
     writerCreatePostStmt = null;
@@ -805,23 +897,9 @@ final class Db {
       return;
     }
     try {
-      closeDb(db);
+      Sqlite.close(db);
     } catch (RuntimeException ignored) {
       // Best effort on shutdown.
-    }
-  }
-
-  private static int closeDb(MemorySegment db) {
-    try {
-      return (int) CLOSE_HANDLE.invokeExact(db);
-    } catch (Throwable t) {
-      if (t instanceof RuntimeException r) {
-        throw r;
-      }
-      if (t instanceof Error e) {
-        throw e;
-      }
-      throw new IllegalStateException(t);
     }
   }
 }

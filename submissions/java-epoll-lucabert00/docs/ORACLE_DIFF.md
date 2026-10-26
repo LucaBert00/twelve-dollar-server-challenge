@@ -34,7 +34,8 @@ record Error(String error) {}
 | Health 200 | `Health(status, db, uptime_s)` | `Json.health` the same three keys | Agree - the suite regex |
 | Degraded 503 | `DegradedHealth(status, db, error)` | `Json.degraded` the same three keys | Agree - the probe message is the `<string>` SPEC allows |
 | Error shape | `Error(error)` -> `{"error":"..."}` | `Json.error` the same | Agree - every error row |
-| Feed order and limit | the reference SQL, `ORDER BY created_at DESC, id DESC LIMIT 20` | `Db.FEED_SQL`, the same reference SQL unchanged | Agree - `test/golden/feed.json` |
+| Feed order and limit | the reference SQL, `ORDER BY created_at DESC, id DESC LIMIT 20` | `Db.FEED_SQL`, the same reference SQL unchanged, and `Db.feed()` dispatches to it whenever the fast path's id window is not contiguous | Agree - `test/golden/feed.json` |
+| Feed fast path | the same row set and order as the reference SQL | `Db.feedFastPath()` runs `id BETWEEN min AND max` only when the newest 20 ids are exactly contiguous; otherwise `Db.feedReference()` | Agree - `FeedPathTest` reports `mismatches=0` on the seed, a fresh database, equal `created_at`, an id gap, a missing row, and the 19/20/21-row boundary |
 | Single lookup | `WHERE p.id = ?` on the base plus the correlated `like_count` | `Db.GET_POST_SQL`, the same | Agree - `test/golden/post-*.json` |
 | Create | trim, then validate, 500 code points, `201` with `like_count: 0` | `Http.prepareWrite` then `Http.executeWrite`, the same order | Agree - the suite's create rows |
 | Like | an existence check, `201` first and `200` on a repeat | `Db.insertLikeInTxn`, one guarded statement, the same three outcomes | Agree - the suite's like rows |
