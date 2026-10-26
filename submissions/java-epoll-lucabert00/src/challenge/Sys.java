@@ -182,7 +182,7 @@ final class Sys {
     SCRATCH.set(JAVA_INT, 40, 1);
     SCRATCH.set(JAVA_INT, 44, 0);
     try {
-      SETSOCKOPT.invokeExact(fd, SOL_SOCKET, SO_LINGER, LINGER, 8);
+      int ignored = (int) SETSOCKOPT.invokeExact(fd, SOL_SOCKET, SO_LINGER, LINGER, 8);
     } catch (Throwable t) {
       throw rethrow(t);
     }
